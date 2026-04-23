@@ -13,3 +13,4 @@ chats.json
 build/
 dist/
 *.spec.bak
+.claude/
