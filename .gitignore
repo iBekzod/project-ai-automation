@@ -10,6 +10,10 @@ __pycache__/
 *.log
 tmp/
 chats.json
+chats.json.bak
+bot.db
+bot.db-shm
+bot.db-wal
 build/
 dist/
 *.spec.bak

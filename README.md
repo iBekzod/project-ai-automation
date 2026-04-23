@@ -84,6 +84,7 @@ tasniflanadi.
 - **`bot.log`** — fayl ichidagi loglar (5 MB rotation, 3 backup).
 - **`/status`** — real vaqt holati.
 - **GUI Logs tab** — jonli oqim.
+- **`bot.db`** (SQLite) — strukturali audit jurnali (`actions` jadvali) + ochiq muammolar + chat sessiyalari + pending tasklar bot qayta ishga tushganda yo'qolmaydi. WAL mode + qisqa muddatli connectionlar — concurrent_updates bilan to'qnashmaydi.
 
 ### 🖥 Desktop GUI (zamonaviy)
 Win11-style **Sun Valley** mavzusi bilan Tkinter ilova:
@@ -107,7 +108,8 @@ PyInstaller orqali `.exe`'ga to'plash mumkin (`build.bat`).
 project-ai-automation/
 ├── main.py             # Telegram bot, command handlers, on_dm/on_group
 ├── claude_runner.py    # Claude CLI integratsiyasi (analyze, classify, chat)
-├── chat_sessions.py    # Multi-session state, JSON persistence
+├── chat_sessions.py    # Multi-session state — SQLite-backed
+├── db.py               # SQLite layer: schema, settings, actions, issues, chats
 ├── bot_controller.py   # PTB lifecycle (Start/Stop/Pause/Resume)
 ├── bot_state.py        # Shared paused flag
 ├── git_ops.py          # apply_fix, push_to_branch, rollback_fix

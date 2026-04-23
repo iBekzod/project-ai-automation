@@ -36,6 +36,7 @@ from telegram.ext import (
 
 import config
 import chat_sessions
+import db
 import git_ops
 import github_ops
 from bot_state import state as bot_state
@@ -130,6 +131,53 @@ class Issue:
 
 
 ISSUES: dict[str, Issue] = {}
+
+
+def _persist_issue(issue: Issue) -> None:
+    """Mirror the in-memory Issue to SQLite. Called after every mutation."""
+    try:
+        from dataclasses import asdict
+        d = asdict(issue)
+        # asdict() turns datetime into a datetime object; SQLite is happy
+        # with the ISO string representation, but we never need to round-
+        # trip created_at so just drop it from the persistence dict.
+        d.pop("created_at", None)
+        db.save_issue(d)
+    except Exception:  # noqa: BLE001
+        log.exception("could not persist issue %s", issue.id)
+
+
+def _drop_issue(issue_id: str) -> None:
+    """Remove from in-memory cache AND mark closed in DB."""
+    ISSUES.pop(issue_id, None)
+    try:
+        db.close_issue(issue_id)
+    except Exception:  # noqa: BLE001
+        log.exception("could not close issue %s in db", issue_id)
+
+
+def _hydrate_issues_from_db() -> None:
+    """Called once at startup so open issues from the previous run come back."""
+    try:
+        for d in db.load_open_issues():
+            issue = Issue(
+                id=d["id"],
+                group_id=d.get("group_id") or 0,
+                group_title=d.get("group_title") or "",
+                message=d.get("message") or "",
+                user_message_id=d.get("user_message_id") or 0,
+                diagnosis=d.get("diagnosis") or {},
+                branch=d.get("branch"),
+                pr_url=d.get("pr_url"),
+                merged_to_stage=bool(d.get("merged_to_stage")),
+                awaiting_retry_prompt=bool(d.get("awaiting_retry_prompt")),
+                retry_initiator=d.get("retry_initiator"),
+            )
+            ISSUES[issue.id] = issue
+        if ISSUES:
+            log.info("hydrated %d open issue(s) from sqlite", len(ISSUES))
+    except Exception:  # noqa: BLE001
+        log.exception("issue hydration failed")
 
 
 # =============================================================================
@@ -303,7 +351,7 @@ async def _process_task(
             return
 
         issue_id = uuid.uuid4().hex[:8]
-        ISSUES[issue_id] = Issue(
+        new_issue = Issue(
             id=issue_id,
             group_id=source_chat_id,
             group_title=source_chat_title,
@@ -311,6 +359,8 @@ async def _process_task(
             user_message_id=source_message_id,
             diagnosis=diagnosis,
         )
+        ISSUES[issue_id] = new_issue
+        _persist_issue(new_issue)
 
         category = diagnosis.get("category") or "unclear"
         summary = diagnosis.get("summary") or ""
@@ -377,10 +427,10 @@ async def on_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if related and _looks_resolved(text):
             log.info(
                 "ack %d superseded by human resolution: %s",
-                related.ack_message.message_id, text[:80],
+                related.ack_message_id, text[:80],
             )
             await _supersede_ack(
-                related,
+                ctx, related,
                 "✅ Xodim javob berdi — AI tahlili to'xtatildi.",
             )
         log.info(
@@ -405,10 +455,12 @@ async def on_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ack = await msg.reply_text("AI tahlil qilmoqda...")
     ongoing = OngoingAck(
         chat_id=msg.chat.id,
-        ack_message=ack,
+        ack_message_id=ack.message_id,
         original_msg_id=msg.message_id,
+        ack_message=ack,
     )
     ONGOING_ACKS[ack.message_id] = ongoing
+    db.save_ongoing_ack(ack.message_id, msg.chat.id, msg.message_id)
 
     effective_text = text or "(Screenshot yuborildi — matn yo'q)"
     # Wrap as a Task so a thread-resolution can cancel it cleanly.
@@ -422,8 +474,9 @@ async def on_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except asyncio.CancelledError:
         log.info("group analysis cancelled — superseded by thread resolution")
     finally:
-        # Clear from registry whether it completed naturally or was cancelled.
+        # Clear from both caches; analysis-complete or cancelled, doesn't matter.
         ONGOING_ACKS.pop(ack.message_id, None)
+        db.remove_ongoing_ack(ack.message_id)
 
 
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -466,7 +519,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "task_ok":
-        stashed = _PENDING_TASKS.pop(payload, None)
+        stashed = db.pop_pending_task(payload)
         if not stashed:
             try:
                 await q.edit_message_text("Vaqt tugagan — qayta yozib yuboring.")
@@ -490,7 +543,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "task_no":
-        stashed = _PENDING_TASKS.pop(payload, None)
+        stashed = db.pop_pending_task(payload)
         if not stashed:
             try:
                 await q.edit_message_text("Vaqt tugagan — qayta yozib yuboring.")
@@ -599,13 +652,14 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "skp":
-        ISSUES.pop(issue_id, None)
+        _drop_issue(issue_id)
         await q.edit_message_text(f"{issue_id} o'tkazib yuborildi.")
         return
 
     if action == "rty":
         issue.awaiting_retry_prompt = True
         issue.retry_initiator = q.from_user.id
+        _persist_issue(issue)
         await q.edit_message_text(
             f"{issue_id} uchun qo'shimcha ko'rsatmani keyingi shaxsiy xabarda yuboring."
         )
@@ -647,7 +701,7 @@ async def _apply_issue(ctx: ContextTypes.DEFAULT_TYPE, issue: Issue) -> None:
     try:
         files = issue.diagnosis.get("files_to_change") or {}
         if not files:
-            ISSUES.pop(issue.id, None)
+            _drop_issue(issue.id)
             await _dm_all_devs(
                 ctx,
                 f"{issue.id} qo'llab bo'lmadi: tashxisda files_to_change yo'q.",
@@ -658,6 +712,7 @@ async def _apply_issue(ctx: ContextTypes.DEFAULT_TYPE, issue: Issue) -> None:
             issue.id, files, issue.diagnosis.get("summary", ""),
         )
         issue.branch = branch
+        _persist_issue(issue)
         pr_url, merged = await asyncio.to_thread(
             github_ops.create_and_merge_pr,
             branch,
@@ -666,6 +721,7 @@ async def _apply_issue(ctx: ContextTypes.DEFAULT_TYPE, issue: Issue) -> None:
         )
         issue.pr_url = pr_url
         issue.merged_to_stage = merged
+        _persist_issue(issue)
 
         status = "stage'ga birlashtirildi" if merged else "PR ochildi (avto-merge bajarilmadi)"
         await _dm_all_devs(
@@ -700,7 +756,7 @@ async def _publish_issue(ctx: ContextTypes.DEFAULT_TYPE, issue: Issue) -> None:
             ctx,
             f"{issue.id} {config.PROD_BRANCH} shoxobchasiga chiqarildi.",
         )
-        ISSUES.pop(issue.id, None)
+        _drop_issue(issue.id)
     else:
         await _dm_all_devs(
             ctx,
@@ -712,12 +768,10 @@ async def _publish_issue(ctx: ContextTypes.DEFAULT_TYPE, issue: Issue) -> None:
 # DM chat mode — multi-session, parallel, intent-routed.
 # =============================================================================
 
-# Pending TASK confirmations: callback_data → (text, image_path_str_or_none).
-# Created when the DM intent classifier says TASK and we ask the dev for
-# confirmation. Cleared once a callback resolves or after ~30 min by natural
-# restart. Keyed by a short hash to keep callback_data under Telegram's 64-byte
-# cap.
-_PENDING_TASKS: dict[str, tuple[str, str | None]] = {}
+# Pending TASK confirmations are persisted in `pending_tasks` SQLite table —
+# survive restart so a "Ha, task" tap an hour after the bot was restarted
+# still works. Access via db.save_pending_task / db.pop_pending_task.
+# Token = sha1(text + image_path) keeps callback_data under Telegram's 64-byte cap.
 
 
 def _auto_chat_name(text: str) -> str:
@@ -737,15 +791,17 @@ def _auto_chat_name(text: str) -> str:
 @dataclass
 class OngoingAck:
     chat_id: int
-    ack_message: object        # PTB Message that we'll edit
+    ack_message_id: int        # used for ctx.bot.edit_message_text after restart
     original_msg_id: int       # the staff complaint that triggered analysis
+    ack_message: object | None = None  # PTB Message — None if we hydrated from DB
     started_at: datetime = field(default_factory=datetime.now)
-    task: asyncio.Task | None = None  # the _process_task wrapper, cancellable
+    task: asyncio.Task | None = None   # in-memory only; lost on restart
 
 
-# Keyed by `bot_ack_message_id` — the ID of the bot's "AI tahlil qilmoqda..."
-# reply. Lookup also walks `original_msg_id` because users may reply to either
-# the bot's ack or the original complaint.
+# In-memory cache for current run — needed because asyncio.Task can't persist.
+# Persistent fields (chat_id, ack_message_id, original_msg_id) are mirrored to
+# SQLite via db.save_ongoing_ack so that even after a restart we can detect a
+# "boldi togrlandi" follow-up and edit the ack message.
 ONGOING_ACKS: dict[int, OngoingAck] = {}
 
 # Resolution-language hints — if a CHAT-classified message in the same thread
@@ -772,29 +828,59 @@ def _looks_resolved(text: str) -> bool:
 
 
 def _find_related_ack(reply_to_msg_id: int | None) -> OngoingAck | None:
-    """Locate an ongoing ack that this incoming message is replying into."""
+    """Locate an ongoing ack the incoming message is replying into.
+
+    Checks the in-memory cache first (has the asyncio.Task we'd want to
+    cancel), then falls back to a SQLite lookup so post-restart acks
+    can still be superseded — we just won't have a Task to cancel.
+    """
     if reply_to_msg_id is None:
         return None
     # Direct: replied to our ack message.
     direct = ONGOING_ACKS.get(reply_to_msg_id)
     if direct:
         return direct
-    # Indirect: replied to the original complaint that triggered our ack.
-    return next(
+    # Indirect: replied to the original complaint.
+    in_mem = next(
         (a for a in ONGOING_ACKS.values() if a.original_msg_id == reply_to_msg_id),
         None,
     )
+    if in_mem:
+        return in_mem
+    # Restart fallback: query SQLite.
+    row = db.find_ack_by_reply(reply_to_msg_id)
+    if row:
+        return OngoingAck(
+            chat_id=row["chat_id"],
+            ack_message_id=row["ack_message_id"],
+            original_msg_id=row["original_msg_id"],
+            ack_message=None,
+        )
+    return None
 
 
-async def _supersede_ack(ack: OngoingAck, new_text: str) -> None:
-    """Cancel the in-flight analysis and edit the bot's ack to `new_text`."""
+async def _supersede_ack(ctx, ack: OngoingAck, new_text: str) -> None:
+    """Cancel the in-flight analysis (if any) and edit the bot's ack message.
+
+    Works for both in-process acks (we have the PTB Message) and post-restart
+    acks (we only have chat_id + message_id).
+    """
     if ack.task and not ack.task.done():
         ack.task.cancel()
     try:
-        await ack.ack_message.edit_text(new_text)
+        if ack.ack_message is not None:
+            await ack.ack_message.edit_text(new_text)
+        else:
+            # Hydrated from DB — no Message object, edit by id.
+            await ctx.bot.edit_message_text(
+                text=new_text,
+                chat_id=ack.chat_id,
+                message_id=ack.ack_message_id,
+            )
     except Exception as exc:  # noqa: BLE001
         log.warning("could not edit superseded ack: %s", exc)
-    ONGOING_ACKS.pop(ack.ack_message.message_id, None)
+    ONGOING_ACKS.pop(ack.ack_message_id, None)
+    db.remove_ongoing_ack(ack.ack_message_id)
 
 
 async def _ensure_active_chat(user_id: int, seed_text: str) -> chat_sessions.ChatSession:
@@ -993,6 +1079,7 @@ async def on_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await msg.reply_text("Claude bu safar tashxis qaytarmadi.")
                 return
             pending.diagnosis = new_diag
+            _persist_issue(pending)
             await _send_diagnosis_dm(ctx, pending.id)
         finally:
             for p in image_paths or []:
@@ -1022,9 +1109,12 @@ async def on_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if intent == "TASK" and not forced:
         # Ask confirmation before firing the heavy pipeline. Keep the image
-        # around until the dev chooses — _PENDING_TASKS carries a path string.
+        # path stored — db.pop_pending_task returns it on tap (survives restart).
         token = _pending_task_id(text + (str(image_path) if image_path else ""))
-        _PENDING_TASKS[token] = (text, str(image_path) if image_path else None)
+        db.save_pending_task(
+            token, user_id, text,
+            str(image_path) if image_path else None,
+        )
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("Ha, task", callback_data=f"task_ok:{token}"),
             InlineKeyboardButton("Yo'q, chat", callback_data=f"task_no:{token}"),
@@ -1279,6 +1369,7 @@ async def cmd_retry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not hint:
         latest.awaiting_retry_prompt = True
         latest.retry_initiator = update.effective_user.id
+        _persist_issue(latest)
         await update.effective_message.reply_text(
             f"{latest.id} uchun qo'shimcha ko'rsatmani keyingi xabarda yuboring."
         )
@@ -1299,6 +1390,7 @@ async def cmd_retry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("Claude bu safar tashxis qaytarmadi.")
         return
     latest.diagnosis = new_diag
+    _persist_issue(latest)
     await _send_diagnosis_dm(ctx, latest.id)
 
 
@@ -1622,7 +1714,7 @@ async def cmd_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if issue is None:
         await update.effective_message.reply_text("O'tkazib yuboriladigan muammo yo'q.")
         return
-    ISSUES.pop(issue.id, None)
+    _drop_issue(issue.id)
     await update.effective_message.reply_text(f"{issue.id} o'tkazib yuborildi.")
 
 
@@ -1704,6 +1796,23 @@ def build_app() -> Application:
     analysis returns, making the bot look frozen.
     """
     validate_config()
+    # SQLite — survive restart, audit log, future settings store.
+    db.init()
+    # One-shot migration: import old chats.json into the chats table.
+    legacy_chats = config.ENV_FILE.parent / "chats.json"
+    if legacy_chats.exists():
+        try:
+            n = db.import_chats_json_if_needed(legacy_chats)
+            if n:
+                bak = legacy_chats.with_suffix(".json.bak")
+                legacy_chats.rename(bak)
+                log.info("imported %d chat(s) from chats.json → renamed to %s", n, bak.name)
+        except Exception:  # noqa: BLE001
+            log.exception("chats.json migration failed; leaving file in place")
+    # Restore open issues from previous run so post-restart Accept/Retry/Skip
+    # buttons still resolve to real Issue objects.
+    _hydrate_issues_from_db()
+
     app = (
         Application.builder()
         .token(config.TELEGRAM_BOT_TOKEN)
