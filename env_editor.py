@@ -22,7 +22,7 @@ class Field:
 
 FIELDS: list[Field] = [
     Field("TELEGRAM_BOT_TOKEN",    "Telegram bot token",   "From @BotFather",                         secret=True,  required=True),
-    Field("TELEGRAM_DEVELOPER_ID", "Your Telegram user ID", "Numeric ID (ask @userinfobot)",           required=True),
+    Field("TELEGRAM_DEVELOPER_IDS","Developer Telegram IDs", "Comma-separated numeric IDs (@userinfobot). Backward-compat: TELEGRAM_DEVELOPER_ID still works.", required=True),
     Field("MONITORED_GROUP_IDS",   "Monitored group IDs",   "Comma-separated, e.g. -1001234,-100567"),
     Field("GITHUB_TOKEN",          "GitHub token",          "PAT with repo scope",                     secret=True),
     Field("GITHUB_REPO",           "GitHub repo",           "owner/repo, e.g. iBekzod/xonsaroy"),
@@ -38,7 +38,9 @@ FIELDS: list[Field] = [
 
 _DEFAULT_TEMPLATE = """# Telegram
 TELEGRAM_BOT_TOKEN=
-TELEGRAM_DEVELOPER_ID=
+# One or more numeric IDs, comma-separated (e.g. 123,456). All listed devs
+# can issue commands; diagnosis DMs are sent to all of them.
+TELEGRAM_DEVELOPER_IDS=
 MONITORED_GROUP_IDS=
 
 # GitHub

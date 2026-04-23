@@ -48,7 +48,30 @@ def _list_str(name: str) -> list[str]:
 
 
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_DEVELOPER_ID: int = _int("TELEGRAM_DEVELOPER_ID")
+
+
+def _developer_ids() -> list[int]:
+    """Read the dev allow-list from either the new plural env var or the
+    legacy singular one (kept for backward compat with existing .env files).
+    """
+    plural = _list_int("TELEGRAM_DEVELOPER_IDS")
+    if plural:
+        return plural
+    return _list_int("TELEGRAM_DEVELOPER_ID")
+
+
+TELEGRAM_DEVELOPER_IDS: list[int] = _developer_ids()
+# Legacy alias kept so older code paths and the GUI still resolve a primary
+# id (e.g. for fallback DM target). Prefer is_developer()/iterating
+# TELEGRAM_DEVELOPER_IDS for new code.
+TELEGRAM_DEVELOPER_ID: int = TELEGRAM_DEVELOPER_IDS[0] if TELEGRAM_DEVELOPER_IDS else 0
+
+
+def is_developer(user_id: int | None) -> bool:
+    """True when `user_id` is in the configured dev allow-list."""
+    return user_id is not None and user_id in TELEGRAM_DEVELOPER_IDS
+
+
 MONITORED_GROUP_IDS: list[int] = _list_int("MONITORED_GROUP_IDS")
 
 GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")
@@ -75,7 +98,8 @@ def reload() -> None:
     load_dotenv(ENV_FILE, override=True)
     g = globals()
     g["TELEGRAM_BOT_TOKEN"]     = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    g["TELEGRAM_DEVELOPER_ID"]  = _int("TELEGRAM_DEVELOPER_ID")
+    g["TELEGRAM_DEVELOPER_IDS"] = _developer_ids()
+    g["TELEGRAM_DEVELOPER_ID"]  = g["TELEGRAM_DEVELOPER_IDS"][0] if g["TELEGRAM_DEVELOPER_IDS"] else 0
     g["MONITORED_GROUP_IDS"]    = _list_int("MONITORED_GROUP_IDS")
     g["GITHUB_TOKEN"]           = os.getenv("GITHUB_TOKEN", "")
     g["GITHUB_REPO"]            = os.getenv("GITHUB_REPO", "")
@@ -93,6 +117,7 @@ def summarize() -> str:
         f"REPO_PATH={REPO_PATH}\n"
         f"GITHUB_REPO={GITHUB_REPO}\n"
         f"STAGE_BRANCH={STAGE_BRANCH}  PROD_BRANCH={PROD_BRANCH}\n"
+        f"DEVELOPER_IDS={TELEGRAM_DEVELOPER_IDS}\n"
         f"MONITORED_GROUP_IDS={MONITORED_GROUP_IDS}\n"
         f"TRIGGER_KEYWORDS={TRIGGER_KEYWORDS or '(all messages)'}\n"
         f"DRY_RUN={DRY_RUN}  CLAUDE_CLI={CLAUDE_CLI}  CLAUDE_TIMEOUT={CLAUDE_TIMEOUT}"

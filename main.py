@@ -56,6 +56,26 @@ logging.basicConfig(
 log = logging.getLogger("bot")
 
 
+async def _dm_all_devs(ctx, text: str, **kwargs) -> None:
+    """Send `text` to every configured developer.
+
+    Used for messages that should reach every dev who can act on them
+    (diagnosis cards, status updates after Accept/Push/Rollback). Per-dev DM
+    failures are logged but don't abort — if one dev's chat is broken, the
+    others still get the message.
+
+    For confirmations tied to ONE dev's tap (TASK confirmation, retry input
+    prompt), keep using direct `q.message.reply_text(...)` or
+    `ctx.bot.send_message(chat_id=that_dev_id, ...)` — those are
+    intentionally per-user.
+    """
+    for dev_id in config.TELEGRAM_DEVELOPER_IDS or []:
+        try:
+            await ctx.bot.send_message(chat_id=dev_id, text=text, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("DM to dev %s failed: %s", dev_id, exc)
+
+
 def _image_tmp_dir() -> Path:
     """Return the directory where photo attachments get staged.
 
@@ -81,6 +101,11 @@ class Issue:
     pr_url: str | None = None
     merged_to_stage: bool = False
     awaiting_retry_prompt: bool = False
+    # When a dev taps the Qayta button or runs `/retry` without a hint, we set
+    # this to their telegram user_id. Only that dev's next DM is consumed as
+    # the retry instruction — prevents cross-talk between multiple devs who
+    # may be acting on different issues at the same time.
+    retry_initiator: int | None = None
     created_at: datetime = field(default_factory=datetime.now)
 
 
@@ -213,11 +238,7 @@ async def _send_diagnosis_dm(ctx: ContextTypes.DEFAULT_TYPE, issue_id: str):
     issue = ISSUES[issue_id]
     cat = (issue.diagnosis.get("category") or "unclear")
     kb = _diagnosis_keyboard(issue_id) if cat == "backend_bug" else _retry_only_keyboard(issue_id)
-    await ctx.bot.send_message(
-        chat_id=config.TELEGRAM_DEVELOPER_ID,
-        text=_format_diagnosis(issue),
-        reply_markup=kb,
-    )
+    await _dm_all_devs(ctx, _format_diagnosis(issue), reply_markup=kb)
 
 
 # ---------- handlers ----------
@@ -368,7 +389,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as exc:  # noqa: BLE001
         log.warning("callback q.answer() failed (likely expired/stale): %s", exc)
 
-    if q.from_user.id != config.TELEGRAM_DEVELOPER_ID:
+    if not config.is_developer(q.from_user.id):
         try:
             await q.edit_message_text("Ruxsat yo'q.")
         except Exception as exc:  # noqa: BLE001
@@ -405,8 +426,10 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text, image_str = stashed
         image_paths = [Path(image_str)] if image_str else None
         await q.edit_message_text("Task sifatida tahlil qilinmoqda...")
+        # Per-tap ack — only the dev who confirmed the TASK sees the in-progress
+        # message; the eventual diagnosis card still fans out to all devs.
         ack = await ctx.bot.send_message(
-            config.TELEGRAM_DEVELOPER_ID,
+            q.from_user.id,
             "Xabar tahlil qilinmoqda...",
         )
         await _process_task(
@@ -487,16 +510,10 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ok, message = await asyncio.to_thread(git_ops.push_to_branch, target)
         except Exception as exc:  # noqa: BLE001
             log.exception("push_to_branch failed")
-            await ctx.bot.send_message(
-                config.TELEGRAM_DEVELOPER_ID,
-                f"/push xato: {exc}",
-            )
+            await _dm_all_devs(ctx, f"/push xato: {exc}")
             return
         icon = "✅" if ok else "❌"
-        await ctx.bot.send_message(
-            config.TELEGRAM_DEVELOPER_ID,
-            f"{icon} {message}",
-        )
+        await _dm_all_devs(ctx, f"{icon} {message}")
         return
 
     if action == "roll_cancel":
@@ -512,16 +529,10 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("rollback_fix failed")
-            await ctx.bot.send_message(
-                config.TELEGRAM_DEVELOPER_ID,
-                f"/rollback xato: {exc}",
-            )
+            await _dm_all_devs(ctx, f"/rollback xato: {exc}")
             return
         icon = "✅" if ok else "❌"
-        await ctx.bot.send_message(
-            config.TELEGRAM_DEVELOPER_ID,
-            f"{icon} {message}",
-        )
+        await _dm_all_devs(ctx, f"{icon} {message}")
         return
 
     # Existing Issue-bound callbacks fall through to the old logic.
@@ -541,6 +552,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if action == "rty":
         issue.awaiting_retry_prompt = True
+        issue.retry_initiator = q.from_user.id
         await q.edit_message_text(
             f"{issue_id} uchun qo'shimcha ko'rsatmani keyingi shaxsiy xabarda yuboring."
         )
@@ -573,8 +585,8 @@ async def _apply_issue(ctx: ContextTypes.DEFAULT_TYPE, issue: Issue) -> None:
         files = issue.diagnosis.get("files_to_change") or {}
         if not files:
             ISSUES.pop(issue.id, None)
-            await ctx.bot.send_message(
-                config.TELEGRAM_DEVELOPER_ID,
+            await _dm_all_devs(
+                ctx,
                 f"{issue.id} qo'llab bo'lmadi: tashxisda files_to_change yo'q.",
             )
             return
@@ -593,17 +605,14 @@ async def _apply_issue(ctx: ContextTypes.DEFAULT_TYPE, issue: Issue) -> None:
         issue.merged_to_stage = merged
 
         status = "stage'ga birlashtirildi" if merged else "PR ochildi (avto-merge bajarilmadi)"
-        await ctx.bot.send_message(
-            config.TELEGRAM_DEVELOPER_ID,
+        await _dm_all_devs(
+            ctx,
             f"{issue.id}: {status}\n{pr_url}",
             reply_markup=_publish_keyboard(issue.id) if merged else None,
         )
     except Exception as exc:  # noqa: BLE001
         log.exception("apply_fix failed")
-        await ctx.bot.send_message(
-            config.TELEGRAM_DEVELOPER_ID,
-            f"{issue.id} qo'llanmadi: {exc}",
-        )
+        await _dm_all_devs(ctx, f"{issue.id} qo'llanmadi: {exc}")
 
 
 async def _publish_issue(ctx: ContextTypes.DEFAULT_TYPE, issue: Issue) -> None:
@@ -612,10 +621,7 @@ async def _publish_issue(ctx: ContextTypes.DEFAULT_TYPE, issue: Issue) -> None:
         ok = await asyncio.to_thread(git_ops.merge_to_prod)
     except Exception as exc:  # noqa: BLE001
         log.exception("publish failed")
-        await ctx.bot.send_message(
-            config.TELEGRAM_DEVELOPER_ID,
-            f"{issue.id} chiqarish bajarilmadi: {exc}",
-        )
+        await _dm_all_devs(ctx, f"{issue.id} chiqarish bajarilmadi: {exc}")
         return
 
     if ok:
@@ -627,14 +633,14 @@ async def _publish_issue(ctx: ContextTypes.DEFAULT_TYPE, issue: Issue) -> None:
             )
         except Exception:  # noqa: BLE001
             log.exception("could not notify group %s", issue.group_id)
-        await ctx.bot.send_message(
-            config.TELEGRAM_DEVELOPER_ID,
+        await _dm_all_devs(
+            ctx,
             f"{issue.id} {config.PROD_BRANCH} shoxobchasiga chiqarildi.",
         )
         ISSUES.pop(issue.id, None)
     else:
-        await ctx.bot.send_message(
-            config.TELEGRAM_DEVELOPER_ID,
+        await _dm_all_devs(
+            ctx,
             f"{issue.id}: {config.PROD_BRANCH} shoxobchasiga birlashtirish bajarilmadi; loglarni tekshiring.",
         )
 
@@ -809,7 +815,7 @@ def _pending_task_id(text: str) -> str:
 
 async def on_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
-    if not msg or not msg.from_user or msg.from_user.id != config.TELEGRAM_DEVELOPER_ID:
+    if not msg or not msg.from_user or not config.is_developer(msg.from_user.id):
         return
     if msg.text and msg.text.startswith("/"):
         return  # commands handled separately
@@ -825,14 +831,20 @@ async def on_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # Priority 1: a Retry (from Qayta button) is waiting for a follow-up.
+    # Only the dev who tapped Qayta can supply the instruction — multi-dev
+    # safe (other devs' DMs flow through the intent classifier as usual).
     pending = next(
-        (i for i in ISSUES.values() if i.awaiting_retry_prompt),
+        (
+            i for i in ISSUES.values()
+            if i.awaiting_retry_prompt and i.retry_initiator == msg.from_user.id
+        ),
         None,
     )
     if pending:
         image_path = await _download_image(ctx, msg) if has_image else None
         image_paths = [image_path] if image_path else None
         pending.awaiting_retry_prompt = False
+        pending.retry_initiator = None
         await msg.reply_text(
             f"{pending.id} sizning izohingiz bilan qayta tahlil qilinmoqda..."
         )
@@ -942,7 +954,7 @@ async def on_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ---------- commands ----------
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != config.TELEGRAM_DEVELOPER_ID:
+    if not config.is_developer(update.effective_user.id):
         return
     mode = "🧪 DRY_RUN" if config.DRY_RUN else "🚀 LIVE"
     await update.effective_message.reply_text(
@@ -957,7 +969,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Verify claude CLI is reachable from the bot's environment."""
-    if update.effective_user.id != config.TELEGRAM_DEVELOPER_ID:
+    if not config.is_developer(update.effective_user.id):
         return
     await update.effective_message.reply_text("Claude tekshirilmoqda...")
     try:
@@ -988,7 +1000,7 @@ def _format_session_row(s: dict) -> str:
 async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """`/chat` shows active chat. `/chat <name>` creates or switches to it."""
     user_id = update.effective_user.id
-    if user_id != config.TELEGRAM_DEVELOPER_ID:
+    if not config.is_developer(user_id):
         return
     args_text = " ".join(ctx.args or []).strip()
     if not args_text:
@@ -1019,7 +1031,7 @@ async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_chatlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """`/chatlist` — show sessions as inline keyboard; tap to switch."""
     user_id = update.effective_user.id
-    if user_id != config.TELEGRAM_DEVELOPER_ID:
+    if not config.is_developer(user_id):
         return
     rows = chat_sessions.export_for_list(user_id)
     if not rows:
@@ -1048,7 +1060,7 @@ async def cmd_chatlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Cancel the active chat's in-flight Claude call."""
     user_id = update.effective_user.id
-    if user_id != config.TELEGRAM_DEVELOPER_ID:
+    if not config.is_developer(user_id):
         return
     active = chat_sessions.active_session(user_id)
     if active is None:
@@ -1068,7 +1080,7 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_ask(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """`/ask <question>` — one-shot read-only Q&A."""
     user_id = update.effective_user.id
-    if user_id != config.TELEGRAM_DEVELOPER_ID:
+    if not config.is_developer(user_id):
         return
     question = " ".join(ctx.args or []).strip()
     if not question:
@@ -1094,7 +1106,7 @@ async def cmd_ask(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """`/task <tavsif>` — explicitly trigger the diagnosis+fix pipeline."""
     user_id = update.effective_user.id
-    if user_id != config.TELEGRAM_DEVELOPER_ID:
+    if not config.is_developer(user_id):
         return
     desc = " ".join(ctx.args or []).strip()
     if not desc:
@@ -1123,7 +1135,7 @@ async def cmd_retry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     the Qayta button). With hint → runs immediately with that hint.
     """
     user_id = update.effective_user.id
-    if user_id != config.TELEGRAM_DEVELOPER_ID:
+    if not config.is_developer(user_id):
         return
     latest = _latest_issue()
     if latest is None:
@@ -1133,6 +1145,7 @@ async def cmd_retry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     hint = " ".join(ctx.args or []).strip()
     if not hint:
         latest.awaiting_retry_prompt = True
+        latest.retry_initiator = update.effective_user.id
         await update.effective_message.reply_text(
             f"{latest.id} uchun qo'shimcha ko'rsatmani keyingi xabarda yuboring."
         )
@@ -1159,7 +1172,7 @@ async def cmd_retry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """`/status` — quick dashboard: mode, chats, open issues, monitored groups."""
     user_id = update.effective_user.id
-    if user_id != config.TELEGRAM_DEVELOPER_ID:
+    if not config.is_developer(user_id):
         return
     uc = chat_sessions.get_user_chats(user_id)
     active = uc.active or "(yo'q)"
@@ -1263,7 +1276,7 @@ async def on_menu_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg or not msg.text or not msg.from_user:
         return
-    if msg.from_user.id != config.TELEGRAM_DEVELOPER_ID:
+    if not config.is_developer(msg.from_user.id):
         return
     cmd_line = BUTTON_DISPATCH.get(msg.text.strip())
     if not cmd_line:
@@ -1302,7 +1315,7 @@ def _menu_button_filter():
 async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """`/menu` — show the persistent command keyboard."""
     user_id = update.effective_user.id
-    if user_id != config.TELEGRAM_DEVELOPER_ID:
+    if not config.is_developer(user_id):
         return
     await update.effective_message.reply_text(
         "Boshqaruv paneli yoqildi. Buyruqlar tugmalar orqali ham ishlaydi.",
@@ -1313,7 +1326,7 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """`/help` — full command reference."""
     user_id = update.effective_user.id
-    if user_id != config.TELEGRAM_DEVELOPER_ID:
+    if not config.is_developer(user_id):
         return
     text = (
         "🤖 *Buyruqlar va tugmalar*\n\n"
@@ -1351,7 +1364,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_stopall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """`/stopall` — cancel in-flight Claude calls on every chat session."""
     user_id = update.effective_user.id
-    if user_id != config.TELEGRAM_DEVELOPER_ID:
+    if not config.is_developer(user_id):
         return
     uc = chat_sessions.get_user_chats(user_id)
     cancelled: list[str] = []
@@ -1382,7 +1395,7 @@ async def cmd_push(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     No arg → shows a 3-button chooser.
     """
     user_id = update.effective_user.id
-    if user_id != config.TELEGRAM_DEVELOPER_ID:
+    if not config.is_developer(user_id):
         return
     args = ctx.args or []
     if not args:
@@ -1443,7 +1456,7 @@ def _issue_for_command(issue_id: str | None, filter_fn=None) -> Issue | None:
 async def cmd_accept(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """`/accept [issue_id]` — apply the fix for the given or latest backend_bug issue."""
     user_id = update.effective_user.id
-    if user_id != config.TELEGRAM_DEVELOPER_ID:
+    if not config.is_developer(user_id):
         return
     args = ctx.args or []
     issue_id = args[0] if args else None
@@ -1466,7 +1479,7 @@ async def cmd_accept(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """`/skip [issue_id]` — drop an issue from ISSUES (latest by default)."""
     user_id = update.effective_user.id
-    if user_id != config.TELEGRAM_DEVELOPER_ID:
+    if not config.is_developer(user_id):
         return
     args = ctx.args or []
     issue_id = args[0] if args else None
@@ -1481,7 +1494,7 @@ async def cmd_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """`/publish [issue_id]` — promote stage → prod for a merged issue (latest by default)."""
     user_id = update.effective_user.id
-    if user_id != config.TELEGRAM_DEVELOPER_ID:
+    if not config.is_developer(user_id):
         return
     args = ctx.args or []
     issue_id = args[0] if args else None
@@ -1500,7 +1513,7 @@ async def cmd_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_rollback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """`/rollback [issue_id]` — revert a bot fix. No arg → latest issue."""
     user_id = update.effective_user.id
-    if user_id != config.TELEGRAM_DEVELOPER_ID:
+    if not config.is_developer(user_id):
         return
     args = ctx.args or []
     issue_id = args[0] if args else None
@@ -1538,7 +1551,10 @@ def _require(name: str, value):
 
 def validate_config():
     _require("TELEGRAM_BOT_TOKEN", config.TELEGRAM_BOT_TOKEN)
-    _require("TELEGRAM_DEVELOPER_ID", config.TELEGRAM_DEVELOPER_ID)
+    if not config.TELEGRAM_DEVELOPER_IDS:
+        raise SystemExit(
+            "Missing env var: TELEGRAM_DEVELOPER_IDS (or legacy TELEGRAM_DEVELOPER_ID)"
+        )
     _require("REPO_PATH", str(config.REPO_PATH))
     if not config.REPO_PATH.exists():
         raise SystemExit(f"REPO_PATH does not exist: {config.REPO_PATH}")

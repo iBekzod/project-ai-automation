@@ -29,6 +29,9 @@ merge qiladi.
   saqlanadi.
 - `/chatlist` orqali chatlar o'rtasida bir bosishda o'tish.
 - `chats.json`'da saqlanadi — bot qayta ishga tushganda ham yo'qolmaydi.
+- **Multi-developer:** har bir dasturchining o'z chatlari alohida saqlanadi
+  (user_id orqali izolyatsiya), tashxis kartalari esa barcha dasturchilarga
+  yuboriladi — kim birinchi tugmani bossa, o'sha amalga oshiradi.
 
 ### 🧠 Avtomatik intent klassifikator
 DM yozsangiz bot avtomatik tushunadi:
@@ -72,9 +75,10 @@ tasniflanadi.
 | `--disallowedTools Edit,Write,...` | Chat rejimida fayl o'zgartirish bloklangan |
 | `DRY_RUN` | Push / PR / merge'larni o'tkazib yuboradi |
 | `ensure_clean_worktree()` | Git operatsiyalarini ifloslangan worktree'dan himoya qiladi |
-| `TELEGRAM_DEVELOPER_ID` | Faqat siz buyruqlarni ishlata olasiz |
+| `TELEGRAM_DEVELOPER_IDS` | Faqat ro'yxatdagi dasturchilar buyruqlarni ishlata oladi (bir nechta dasturchi qo'llab-quvvatlanadi) |
 | Inline confirmation | Har bir destruktiv operatsiya uchun |
 | `MAX_PARALLEL_CLAUDE` | Bir vaqtda 5 ta Claude'dan ortiq ishlamaydi |
+| Retry isolation | Har bir dasturchining `Qayta` so'rovi faqat o'zining DM'idan kelgan izohga javob beradi |
 
 ### 📊 Monitoring va loglar
 - **`bot.log`** — fayl ichidagi loglar (5 MB rotation, 3 backup).
@@ -150,7 +154,7 @@ project-ai-automation/
    | O'zgaruvchi | Qiymat | Qayerdan olish |
    |---|---|---|
    | `TELEGRAM_BOT_TOKEN` | bot tokeni | [@BotFather](https://t.me/BotFather) |
-   | `TELEGRAM_DEVELOPER_ID` | sizning Telegram numeric ID | [@userinfobot](https://t.me/userinfobot) |
+   | `TELEGRAM_DEVELOPER_IDS` | bir yoki bir nechta numeric ID, vergul bilan | [@userinfobot](https://t.me/userinfobot) — har bir dasturchi uchun |
    | `MONITORED_GROUP_IDS` | guruh chat_id'lari (vergul bilan) | botni guruhga qo'shing, `/whereami` yozing |
    | `GITHUB_TOKEN` | repo scope bilan PAT | [github.com/settings/tokens](https://github.com/settings/tokens) |
    | `GITHUB_REPO` | `owner/repo` formatida | masalan `iBekzod/xonsaroy` |
