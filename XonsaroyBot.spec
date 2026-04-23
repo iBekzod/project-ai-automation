@@ -9,7 +9,9 @@ hidden = []
 hidden += collect_submodules("telegram")
 hidden += collect_submodules("telegram.ext")
 hidden += collect_submodules("github")
-hidden += ["dotenv", "dotenv.main"]
+hidden += collect_submodules("pystray")  # platform backend (win32/gtk/...)
+hidden += collect_submodules("PIL")       # tray icon rendering
+hidden += ["dotenv", "dotenv.main", "sv_ttk"]
 
 block_cipher = None
 

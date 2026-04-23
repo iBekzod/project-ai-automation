@@ -1,3 +1,6 @@
 python-telegram-bot==21.6
 PyGithub==2.4.0
 python-dotenv==1.0.1
+sv-ttk==2.6.0
+pystray==0.19.5
+Pillow==10.4.0

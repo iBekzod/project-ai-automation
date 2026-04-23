@@ -85,9 +85,19 @@ tasniflanadi.
 - **`/status`** — real vaqt holati.
 - **GUI Logs tab** — jonli oqim.
 
-### 🖥 Desktop GUI
-Tkinter asosidagi ilova: **Start / Pause / Resume / Stop / Settings / Logs**
-yorliqlari bilan. PyInstaller orqali `.exe`'ga to'plash mumkin.
+### 🖥 Desktop GUI (zamonaviy)
+Win11-style **Sun Valley** mavzusi bilan Tkinter ilova:
+- **📊 Dashboard** — bot holati, rejim/repo/guruhlar kartalari, to'liq konfiguratsiya
+- **⚙ Settings** — Telegram / GitHub / Repository / Behaviour bo'limlariga ajratilgan
+- **📜 Logs** — INFO / WARNING / ERROR rangli ajratilgan jonli oqim
+
+**Background rejim:**
+- Oynani yopish — system tray'ga minimallashtirib qo'yadi (bot ishlashda davom etadi)
+- Tray ikonkasi rangi botning holatini ko'rsatadi (yashil = ishlamoqda, kulrang = to'xtagan)
+- Tray menyu: **Show / Hide / Start bot / Stop bot / Quit**
+- **Quit** botni xavfsiz to'xtatib, chiqib ketadi
+
+PyInstaller orqali `.exe`'ga to'plash mumkin (`build.bat`).
 
 ---
 
