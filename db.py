@@ -118,6 +118,56 @@ CREATE TABLE IF NOT EXISTS ongoing_acks (
     started_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_acks_orig ON ongoing_acks(original_msg_id);
+
+-- ============================================================================
+-- Multi-project model — a "project" is an ecosystem (e.g. "Xonsaroy") that
+-- contains one or more repos (backend, mobile, frontend, admin, ...). One
+-- Telegram group may discuss multiple projects (M:N via group_project_links).
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS projects (
+    id            TEXT PRIMARY KEY,                 -- short slug, e.g. "xonsaroy"
+    name          TEXT NOT NULL,                    -- display name
+    description   TEXT,                              -- scope hint for classifier
+    github_token  TEXT,                              -- per-project PAT (NULL = use settings.github_token)
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS repos (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id    TEXT NOT NULL,
+    role          TEXT NOT NULL,                    -- "backend" / "mobile" / "frontend" / "admin" / ...
+    label         TEXT,                              -- display label
+    description   TEXT,                              -- per-repo scope hint
+    repo_path     TEXT NOT NULL,                    -- local clone absolute path
+    github_repo   TEXT NOT NULL,                    -- "owner/repo"
+    stage_branch  TEXT NOT NULL DEFAULT 'stage',
+    prod_branch   TEXT NOT NULL DEFAULT 'main',
+    test_command  TEXT,
+    is_active     INTEGER DEFAULT 1,
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (project_id, role),                       -- one role per project
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_repos_project ON repos(project_id);
+
+CREATE TABLE IF NOT EXISTS group_project_links (
+    chat_id     INTEGER NOT NULL,
+    project_id  TEXT NOT NULL,
+    PRIMARY KEY (chat_id, project_id),
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_gpl_proj ON group_project_links(project_id);
+
+-- Developers — moves from TELEGRAM_DEVELOPER_IDS env var to a table you can
+-- edit at runtime. .env value seeds this on first run.
+CREATE TABLE IF NOT EXISTS developers (
+    user_id   INTEGER PRIMARY KEY,
+    label     TEXT,
+    added_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    added_by  INTEGER
+);
 """
 
 
@@ -411,14 +461,204 @@ def find_ack_by_reply(reply_to_msg_id: int) -> dict | None:
 # Migration helpers
 # ============================================================================
 
-def import_chats_json_if_needed(json_path: Path) -> int:
-    """One-shot import of legacy chats.json into the chats table.
+# ============================================================================
+# projects + repos — a project is an ecosystem (e.g. "Xonsaroy") containing
+# multiple repos (backend / mobile / frontend / ...). Each project may be
+# linked to one or more Telegram groups.
+# ============================================================================
 
-    Returns number of chats imported. Safe to call repeatedly — already-
-    present rows get upserted (no duplicates) but existing turn counts
-    will be overwritten on subsequent runs, so this is intended to fire
-    exactly once during the migration window.
-    """
+def list_projects() -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM projects ORDER BY name"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_project(project_id: str) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM projects WHERE id=?", (project_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def upsert_project(
+    project_id: str,
+    name: str,
+    description: str | None = None,
+    github_token: str | None = None,
+) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """INSERT INTO projects(id, name, description, github_token, updated_at)
+               VALUES(?, ?, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(id) DO UPDATE SET
+                   name=excluded.name,
+                   description=excluded.description,
+                   github_token=COALESCE(excluded.github_token, projects.github_token),
+                   updated_at=CURRENT_TIMESTAMP""",
+            (project_id, name, description, github_token),
+        )
+
+
+def delete_project(project_id: str) -> None:
+    """Drops the project. Cascades to its repos and group links via FK."""
+    with _connect() as conn:
+        conn.execute("DELETE FROM projects WHERE id=?", (project_id,))
+
+
+def list_repos(project_id: str | None = None) -> list[dict]:
+    with _connect() as conn:
+        if project_id:
+            rows = conn.execute(
+                "SELECT * FROM repos WHERE project_id=? AND is_active=1 ORDER BY role",
+                (project_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM repos WHERE is_active=1 ORDER BY project_id, role",
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_repo(project_id: str, role: str) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM repos WHERE project_id=? AND role=?",
+            (project_id, role),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def upsert_repo(
+    project_id: str,
+    role: str,
+    repo_path: str,
+    github_repo: str,
+    *,
+    label: str | None = None,
+    description: str | None = None,
+    stage_branch: str = "stage",
+    prod_branch: str = "main",
+    test_command: str | None = None,
+    is_active: bool = True,
+) -> int:
+    """Insert or update by (project_id, role). Returns the row id."""
+    with _connect() as conn:
+        conn.execute(
+            """INSERT INTO repos(
+                project_id, role, label, description, repo_path, github_repo,
+                stage_branch, prod_branch, test_command, is_active
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, role) DO UPDATE SET
+                label=excluded.label,
+                description=excluded.description,
+                repo_path=excluded.repo_path,
+                github_repo=excluded.github_repo,
+                stage_branch=excluded.stage_branch,
+                prod_branch=excluded.prod_branch,
+                test_command=excluded.test_command,
+                is_active=excluded.is_active
+            """,
+            (
+                project_id, role, label, description, repo_path, github_repo,
+                stage_branch, prod_branch, test_command, int(is_active),
+            ),
+        )
+        row = conn.execute(
+            "SELECT id FROM repos WHERE project_id=? AND role=?",
+            (project_id, role),
+        ).fetchone()
+    return int(row["id"])
+
+
+def deactivate_repo(project_id: str, role: str) -> None:
+    """Soft-delete (keeps history; flips is_active=0)."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE repos SET is_active=0 WHERE project_id=? AND role=?",
+            (project_id, role),
+        )
+
+
+# ----- group ↔ project links (M:N) -----
+
+def link_group_to_project(chat_id: int, project_id: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO group_project_links(chat_id, project_id) VALUES(?, ?)",
+            (chat_id, project_id),
+        )
+
+
+def unlink_group_from_project(chat_id: int, project_id: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "DELETE FROM group_project_links WHERE chat_id=? AND project_id=?",
+            (chat_id, project_id),
+        )
+
+
+def projects_for_group(chat_id: int) -> list[dict]:
+    """Every project this Telegram group monitors. Empty list = all projects
+    are considered (useful before any links are configured)."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT p.* FROM projects p
+               JOIN group_project_links g ON g.project_id = p.id
+               WHERE g.chat_id = ?
+               ORDER BY p.name""",
+            (chat_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def groups_for_project(project_id: str) -> list[int]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT chat_id FROM group_project_links WHERE project_id=?",
+            (project_id,),
+        ).fetchall()
+    return [int(r["chat_id"]) for r in rows]
+
+
+# ============================================================================
+# developers — replaces .env TELEGRAM_DEVELOPER_IDS as the source of truth.
+# .env value seeds this on first start; after that, edit via DB / future GUI.
+# ============================================================================
+
+def list_developers() -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT user_id, label, added_at, added_by FROM developers ORDER BY added_at",
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_developer(user_id: int, label: str | None = None, added_by: int | None = None) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO developers(user_id, label, added_by) VALUES(?, ?, ?)""",
+            (user_id, label, added_by),
+        )
+
+
+def remove_developer(user_id: int) -> None:
+    with _connect() as conn:
+        conn.execute("DELETE FROM developers WHERE user_id=?", (user_id,))
+
+
+def is_developer_in_db(user_id: int) -> bool:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM developers WHERE user_id=?", (user_id,),
+        ).fetchone()
+    return row is not None
+
+
+def import_chats_json_if_needed(json_path: Path) -> int:
+    """One-shot import of legacy chats.json into the chats table."""
     if not json_path.exists():
         return 0
     try:
@@ -444,3 +684,70 @@ def import_chats_json_if_needed(json_path: Path) -> int:
             set_active_chat(uid, active_name)
     log.info("migrated %d chats from %s", imported, json_path)
     return imported
+
+
+def bootstrap_from_env(
+    *,
+    repo_path: str,
+    github_repo: str,
+    stage_branch: str,
+    prod_branch: str,
+    monitored_groups: list[int],
+    developer_ids: list[int],
+    github_token: str | None = None,
+    trigger_keywords: str = "",
+    dry_run: bool = True,
+    claude_cli: str = "claude",
+    claude_timeout: int = 900,
+    max_parallel_claude: int = 5,
+) -> None:
+    """First-run population: project + repo + group links + dev list + settings.
+
+    Idempotent — only writes the project/repo if no projects exist yet, and
+    only seeds the developer table for IDs not already present. Always
+    refreshes the settings table from the provided values when missing
+    (won't overwrite an already-set DB value).
+    """
+    if not list_projects():
+        # No projects yet — create a default "main" one from .env values.
+        upsert_project(
+            "main",
+            name="Default Project",
+            description="Auto-created from .env on first start. Rename/extend later.",
+            github_token=github_token,
+        )
+        if repo_path and github_repo:
+            upsert_repo(
+                "main", "backend",
+                repo_path=repo_path,
+                github_repo=github_repo,
+                label="Backend (auto-imported)",
+                description="Initial backend repo from .env REPO_PATH.",
+                stage_branch=stage_branch or "stage",
+                prod_branch=prod_branch or "main",
+            )
+        for chat_id in monitored_groups or []:
+            link_group_to_project(chat_id, "main")
+        log.info("bootstrapped 'main' project from .env values")
+
+    # Seed developer allow-list (idempotent; INSERT OR IGNORE).
+    for uid in developer_ids or []:
+        add_developer(uid)
+
+    # Seed mutable settings only if not yet in the table — never overwrite.
+    seed_pairs = [
+        ("TRIGGER_KEYWORDS",     trigger_keywords),
+        ("DRY_RUN",              "true" if dry_run else "false"),
+        ("CLAUDE_CLI",           claude_cli),
+        ("CLAUDE_TIMEOUT",       str(claude_timeout)),
+        ("MAX_PARALLEL_CLAUDE",  str(max_parallel_claude)),
+        ("STAGE_BRANCH",         stage_branch or "stage"),
+        ("PROD_BRANCH",          prod_branch or "main"),
+        ("GITHUB_REPO",          github_repo or ""),
+        ("REPO_PATH",            repo_path or ""),
+    ]
+    if github_token:
+        seed_pairs.append(("GITHUB_TOKEN", github_token))
+    for key, val in seed_pairs:
+        if get_setting(key) is None:
+            set_setting(key, val)

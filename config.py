@@ -68,8 +68,23 @@ TELEGRAM_DEVELOPER_ID: int = TELEGRAM_DEVELOPER_IDS[0] if TELEGRAM_DEVELOPER_IDS
 
 
 def is_developer(user_id: int | None) -> bool:
-    """True when `user_id` is in the configured dev allow-list."""
-    return user_id is not None and user_id in TELEGRAM_DEVELOPER_IDS
+    """True when `user_id` is in the dev allow-list.
+
+    Checks both the DB `developers` table (source of truth at runtime) and
+    the cached TELEGRAM_DEVELOPER_IDS list (covers the very-first-call
+    window before db.init() has run).
+    """
+    if user_id is None:
+        return False
+    if user_id in TELEGRAM_DEVELOPER_IDS:
+        return True
+    try:
+        import db as _db
+        if _db._db_path is not None:
+            return _db.is_developer_in_db(user_id)
+    except Exception:
+        pass
+    return False
 
 
 MONITORED_GROUP_IDS: list[int] = _list_int("MONITORED_GROUP_IDS")
@@ -93,23 +108,75 @@ CLAUDE_CLI: str = os.getenv("CLAUDE_CLI", "claude")
 CLAUDE_TIMEOUT: int = _int("CLAUDE_TIMEOUT", 900)
 
 
+# Mutable settings keys that live in the SQLite `settings` table when
+# present. .env values seed these on first run; runtime edits via the GUI
+# Settings tab or `/status` toggle write back to the table.
+_DB_BACKED_KEYS = {
+    "TRIGGER_KEYWORDS",
+    "DRY_RUN",
+    "CLAUDE_CLI",
+    "CLAUDE_TIMEOUT",
+    "MAX_PARALLEL_CLAUDE",
+    "STAGE_BRANCH",
+    "PROD_BRANCH",
+    "GITHUB_TOKEN",
+    "GITHUB_REPO",
+    "REPO_PATH",
+}
+
+
+def _settings_from_db() -> dict[str, str]:
+    """Return all DB-backed settings, or an empty dict if DB isn't ready yet
+    (e.g. during the very first build_app() call before db.init())."""
+    try:
+        import db as _db  # local import — avoids circular at startup
+        if _db._db_path is None:  # init() hasn't run yet
+            return {}
+        out: dict[str, str] = {}
+        for key in _DB_BACKED_KEYS:
+            v = _db.get_setting(key)
+            if v is not None:
+                out[key] = v
+        return out
+    except Exception:
+        return {}
+
+
+def _resolved(name: str, env_default: str = "") -> str:
+    """DB value if present (from settings table), else .env, else default."""
+    db_overrides = _settings_from_db()
+    if name in db_overrides:
+        return db_overrides[name]
+    return os.getenv(name, env_default)
+
+
 def reload() -> None:
-    """Re-read the .env file and refresh module-level settings in place."""
+    """Re-read .env + DB-backed settings; refresh module-level attributes."""
     load_dotenv(ENV_FILE, override=True)
     g = globals()
+    overrides = _settings_from_db()
+
+    def pick(name: str, env_default: str = "") -> str:
+        return overrides.get(name, os.getenv(name, env_default))
+
     g["TELEGRAM_BOT_TOKEN"]     = os.getenv("TELEGRAM_BOT_TOKEN", "")
     g["TELEGRAM_DEVELOPER_IDS"] = _developer_ids()
     g["TELEGRAM_DEVELOPER_ID"]  = g["TELEGRAM_DEVELOPER_IDS"][0] if g["TELEGRAM_DEVELOPER_IDS"] else 0
     g["MONITORED_GROUP_IDS"]    = _list_int("MONITORED_GROUP_IDS")
-    g["GITHUB_TOKEN"]           = os.getenv("GITHUB_TOKEN", "")
-    g["GITHUB_REPO"]            = os.getenv("GITHUB_REPO", "")
-    g["REPO_PATH"]              = Path(os.getenv("REPO_PATH", "")).resolve()
-    g["STAGE_BRANCH"]           = os.getenv("STAGE_BRANCH", "stage")
-    g["PROD_BRANCH"]            = os.getenv("PROD_BRANCH", "dev")
-    g["TRIGGER_KEYWORDS"]       = _list_str("TRIGGER_KEYWORDS")
-    g["DRY_RUN"]                = _bool("DRY_RUN", True)
-    g["CLAUDE_CLI"]             = os.getenv("CLAUDE_CLI", "claude")
-    g["CLAUDE_TIMEOUT"]         = _int("CLAUDE_TIMEOUT", 900)
+    g["GITHUB_TOKEN"]           = pick("GITHUB_TOKEN")
+    g["GITHUB_REPO"]            = pick("GITHUB_REPO")
+    g["REPO_PATH"]              = Path(pick("REPO_PATH")).resolve() if pick("REPO_PATH") else Path()
+    g["STAGE_BRANCH"]           = pick("STAGE_BRANCH", "stage")
+    g["PROD_BRANCH"]            = pick("PROD_BRANCH", "dev")
+    raw_trig = pick("TRIGGER_KEYWORDS", "")
+    g["TRIGGER_KEYWORDS"]       = [
+        x.lower() for x in (p.strip() for p in raw_trig.split(",")) if x
+    ]
+    raw_dry = pick("DRY_RUN", "true").strip().lower()
+    g["DRY_RUN"]                = raw_dry in ("1", "true", "yes", "on")
+    g["CLAUDE_CLI"]             = pick("CLAUDE_CLI", "claude")
+    raw_to = pick("CLAUDE_TIMEOUT", "900").strip()
+    g["CLAUDE_TIMEOUT"]         = int(raw_to) if raw_to.isdigit() else 900
 
 
 def summarize() -> str:

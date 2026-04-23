@@ -1796,9 +1796,9 @@ def build_app() -> Application:
     analysis returns, making the bot look frozen.
     """
     validate_config()
-    # SQLite — survive restart, audit log, future settings store.
+    # SQLite — survive restart, audit log, settings store, projects model.
     db.init()
-    # One-shot migration: import old chats.json into the chats table.
+    # One-shot migrations.
     legacy_chats = config.ENV_FILE.parent / "chats.json"
     if legacy_chats.exists():
         try:
@@ -1809,6 +1809,28 @@ def build_app() -> Application:
                 log.info("imported %d chat(s) from chats.json → renamed to %s", n, bak.name)
         except Exception:  # noqa: BLE001
             log.exception("chats.json migration failed; leaving file in place")
+    # Bootstrap projects/repos/developers/settings from .env on first start.
+    # Idempotent — re-running just refreshes missing settings, never clobbers
+    # an existing project or already-set settings value.
+    try:
+        db.bootstrap_from_env(
+            repo_path=str(config.REPO_PATH) if config.REPO_PATH else "",
+            github_repo=config.GITHUB_REPO,
+            stage_branch=config.STAGE_BRANCH,
+            prod_branch=config.PROD_BRANCH,
+            monitored_groups=config.MONITORED_GROUP_IDS,
+            developer_ids=config.TELEGRAM_DEVELOPER_IDS,
+            github_token=config.GITHUB_TOKEN or None,
+            trigger_keywords=",".join(config.TRIGGER_KEYWORDS),
+            dry_run=config.DRY_RUN,
+            claude_cli=config.CLAUDE_CLI,
+            claude_timeout=config.CLAUDE_TIMEOUT,
+            max_parallel_claude=int(__import__("os").environ.get("MAX_PARALLEL_CLAUDE", "5") or "5"),
+        )
+        # Reload so DB-backed values take effect immediately for this run.
+        config.reload()
+    except Exception:  # noqa: BLE001
+        log.exception("bootstrap_from_env failed; continuing on .env values")
     # Restore open issues from previous run so post-restart Accept/Retry/Skip
     # buttons still resolve to real Issue objects.
     _hydrate_issues_from_db()
