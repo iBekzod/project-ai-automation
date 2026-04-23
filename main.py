@@ -369,6 +369,20 @@ async def on_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     if not is_problem:
         _cleanup_image(image_path)
+        # If this CHAT-classified message is a reply *into* an ongoing
+        # analysis thread AND signals resolution, supersede our pending
+        # "AI tahlil qilmoqda..." ack — the staff handled it themselves.
+        reply_to_id = msg.reply_to_message.message_id if msg.reply_to_message else None
+        related = _find_related_ack(reply_to_id)
+        if related and _looks_resolved(text):
+            log.info(
+                "ack %d superseded by human resolution: %s",
+                related.ack_message.message_id, text[:80],
+            )
+            await _supersede_ack(
+                related,
+                "✅ Xodim javob berdi — AI tahlili to'xtatildi.",
+            )
         log.info(
             "stage1 → skip (reason=%s) in %s: %s",
             reason, msg.chat.title, text[:80] if text else "(no caption)",
@@ -380,7 +394,8 @@ async def on_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # qilmoqda" ack as a reply to staff so they know the bot is on it, then
     # run the full analyse flow. _process_task will edit the ack to the
     # final verdict (backend_bug → "Tekshirilmoqda...", unclear → "Qo'shimcha
-    # ma'lumot kerak...", etc).
+    # ma'lumot kerak...", etc). The ack is registered in ONGOING_ACKS so a
+    # subsequent "boldi togrlandi" follow-up can supersede it.
     group_title = msg.chat.title or str(msg.chat.id)
     log.info(
         "stage1 → our_problem (reason=%s); stage2 analysing msg in %s (image=%s): %s",
@@ -388,12 +403,27 @@ async def on_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
     ack = await msg.reply_text("AI tahlil qilmoqda...")
+    ongoing = OngoingAck(
+        chat_id=msg.chat.id,
+        ack_message=ack,
+        original_msg_id=msg.message_id,
+    )
+    ONGOING_ACKS[ack.message_id] = ongoing
 
     effective_text = text or "(Screenshot yuborildi — matn yo'q)"
-    await _process_task(
+    # Wrap as a Task so a thread-resolution can cancel it cleanly.
+    task = asyncio.create_task(_process_task(
         ctx, effective_text, msg.chat.id, group_title, msg.message_id, ack,
         image_paths=[image_path] if image_path else None,
-    )
+    ))
+    ongoing.task = task
+    try:
+        await task
+    except asyncio.CancelledError:
+        log.info("group analysis cancelled — superseded by thread resolution")
+    finally:
+        # Clear from registry whether it completed naturally or was cancelled.
+        ONGOING_ACKS.pop(ack.message_id, None)
 
 
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -697,6 +727,74 @@ def _auto_chat_name(text: str) -> str:
         return "chat"
     short = t[:28].strip()
     return short or "chat"
+
+
+# =============================================================================
+# Live ack tracking — supersede in-flight "AI tahlil qilmoqda..." messages
+# when the staff thread resolves the issue manually before our analysis ends.
+# =============================================================================
+
+@dataclass
+class OngoingAck:
+    chat_id: int
+    ack_message: object        # PTB Message that we'll edit
+    original_msg_id: int       # the staff complaint that triggered analysis
+    started_at: datetime = field(default_factory=datetime.now)
+    task: asyncio.Task | None = None  # the _process_task wrapper, cancellable
+
+
+# Keyed by `bot_ack_message_id` — the ID of the bot's "AI tahlil qilmoqda..."
+# reply. Lookup also walks `original_msg_id` because users may reply to either
+# the bot's ack or the original complaint.
+ONGOING_ACKS: dict[int, OngoingAck] = {}
+
+# Resolution-language hints — if a CHAT-classified message in the same thread
+# contains any of these, we treat it as the staff resolving the complaint
+# manually and supersede our pending analysis.
+_RESOLUTION_HINTS = {
+    # Uzbek Latin
+    "boldi", "bo'ldi", "to'g'rlandi", "togrlandi", "tugadi", "tugatildi",
+    "tuzatildi", "tuzaldi", "hal qilindi", "hal bo'ldi", "ishladi",
+    "ishlayapti", "ko'rdim", "tayyor", "rahmat", "rahmat tuzatildi",
+    # Russian
+    "готово", "сделано", "решено", "исправлено", "работает", "спасибо",
+    # English / mixed
+    "fixed", "done", "resolved", "thanks", "thank you", "ok thanks",
+}
+
+
+def _looks_resolved(text: str) -> bool:
+    """Loose substring check for resolution language."""
+    if not text:
+        return False
+    lowered = text.lower().strip()
+    return any(h in lowered for h in _RESOLUTION_HINTS)
+
+
+def _find_related_ack(reply_to_msg_id: int | None) -> OngoingAck | None:
+    """Locate an ongoing ack that this incoming message is replying into."""
+    if reply_to_msg_id is None:
+        return None
+    # Direct: replied to our ack message.
+    direct = ONGOING_ACKS.get(reply_to_msg_id)
+    if direct:
+        return direct
+    # Indirect: replied to the original complaint that triggered our ack.
+    return next(
+        (a for a in ONGOING_ACKS.values() if a.original_msg_id == reply_to_msg_id),
+        None,
+    )
+
+
+async def _supersede_ack(ack: OngoingAck, new_text: str) -> None:
+    """Cancel the in-flight analysis and edit the bot's ack to `new_text`."""
+    if ack.task and not ack.task.done():
+        ack.task.cancel()
+    try:
+        await ack.ack_message.edit_text(new_text)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not edit superseded ack: %s", exc)
+    ONGOING_ACKS.pop(ack.ack_message.message_id, None)
 
 
 async def _ensure_active_chat(user_id: int, seed_text: str) -> chat_sessions.ChatSession:
