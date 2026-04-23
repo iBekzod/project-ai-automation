@@ -56,6 +56,26 @@ logging.basicConfig(
 log = logging.getLogger("bot")
 
 
+async def _safe_md_send(send_fn, text: str, **kwargs) -> None:
+    """Send `text` via `send_fn` with parse_mode='Markdown', falling back to
+    plain text if Telegram rejects the parse.
+
+    Telegram's legacy Markdown is fragile around stray underscores
+    (`DRY_RUN` becomes "DRY" + italic-open + "RUN" → unterminated entity)
+    and other special chars. Rather than escape every dynamic value at the
+    call site, we attempt the formatted send once and degrade gracefully
+    on failure.
+    """
+    try:
+        await send_fn(text, parse_mode="Markdown", **kwargs)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("markdown send failed (%s); retrying as plain text", exc)
+        try:
+            await send_fn(text, **kwargs)
+        except Exception:  # noqa: BLE001
+            log.exception("plain-text fallback also failed")
+
+
 async def _dm_all_devs(ctx, text: str, **kwargs) -> None:
     """Send `text` to every configured developer.
 
@@ -522,7 +542,10 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if action == "roll_ok":
         issue_id_to_revert = payload
-        await q.edit_message_text(f"`{issue_id_to_revert}` revert qilinmoqda...", parse_mode="Markdown")
+        await _safe_md_send(
+            q.edit_message_text,
+            f"`{issue_id_to_revert}` revert qilinmoqda...",
+        )
         try:
             ok, message = await asyncio.to_thread(
                 git_ops.rollback_fix, issue_id_to_revert,
@@ -966,14 +989,16 @@ async def on_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not config.is_developer(update.effective_user.id):
         return
-    mode = "🧪 DRY_RUN" if config.DRY_RUN else "🚀 LIVE"
-    await update.effective_message.reply_text(
-        f"👋 Bot ishlamoqda · *{mode}*\n\n"
+    # Backticks around the mode label so the underscore in DRY_RUN is treated
+    # as code rather than Markdown italic open.
+    mode = "🧪 `DRY_RUN`" if config.DRY_RUN else "🚀 `LIVE`"
+    await _safe_md_send(
+        update.effective_message.reply_text,
+        f"👋 Bot ishlamoqda · {mode}\n\n"
         "Pastdagi tugmalardan foydalaning yoki istalgan xabar yozing — bot avtomatik tushunadi.\n\n"
         "📖 To'liq yordam: */help*\n"
         "📊 Hozirgi holat: */status*",
         reply_markup=MAIN_MENU,
-        parse_mode="Markdown",
     )
 
 
@@ -1193,7 +1218,11 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     open_issues = sorted(ISSUES.values(), key=lambda i: i.created_at, reverse=True)
 
-    mode = "🧪 DRY_RUN" if config.DRY_RUN else "🚀 LIVE"
+    # Mode text wraps the literal in backticks so the inner underscore is
+    # treated as code, not Markdown italic. Without this, "DRY_RUN" makes
+    # Telegram throw "can't find end of the entity" (legacy Markdown parses
+    # `_..._` as italic and we never close it).
+    mode = "🧪 `DRY_RUN`" if config.DRY_RUN else "🚀 `LIVE`"
     lines = [
         "📊 *Holat*",
         "",
@@ -1210,7 +1239,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             title = (issue.group_title or "?")[:28]
             lines.append(f"  • `{issue.id}` · {cat} · {title}")
     lines.append("")
-    lines.append(f"REPO_PATH: `{config.REPO_PATH}`")
+    lines.append(f"REPO\\_PATH: `{config.REPO_PATH}`")
     lines.append(f"Branches: stage=`{config.STAGE_BRANCH}` prod=`{config.PROD_BRANCH}`")
     lines.append(f"Groups: {config.MONITORED_GROUP_IDS}")
 
@@ -1226,10 +1255,10 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ),
         ],
     ])
-    await update.effective_message.reply_text(
+    await _safe_md_send(
+        update.effective_message.reply_text,
         "\n".join(lines),
         reply_markup=kb,
-        parse_mode="Markdown",
     )
 
 
@@ -1366,9 +1395,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "\n"
         "_Free-text DM avtomatik klassifikator orqali yo'naltiriladi._"
     )
-    await update.effective_message.reply_text(
-        text, parse_mode="Markdown", reply_markup=MAIN_MENU,
-    )
+    await _safe_md_send(update.effective_message.reply_text, text, reply_markup=MAIN_MENU)
 
 
 async def cmd_stopall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1534,9 +1561,9 @@ async def cmd_rollback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         issue_id = latest.id
     elif issue_id not in ISSUES:
-        await update.effective_message.reply_text(
+        await _safe_md_send(
+            update.effective_message.reply_text,
             f"`{issue_id}` topilmadi. Aniq ID bering yoki `/rollback` bilan oxirgisini tanlang.",
-            parse_mode="Markdown",
         )
         return
 
@@ -1544,11 +1571,11 @@ async def cmd_rollback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("Ha, revert qil", callback_data=f"roll_ok:{issue_id}"),
         InlineKeyboardButton("Bekor", callback_data="roll_cancel:_"),
     ]])
-    await update.effective_message.reply_text(
+    await _safe_md_send(
+        update.effective_message.reply_text,
         f"`{issue_id}` commitini revert qilaymi?\n"
         f"stage va prod ({config.PROD_BRANCH}) branchlarida yangi revert commit yaratiladi.",
         reply_markup=kb,
-        parse_mode="Markdown",
     )
 
 
