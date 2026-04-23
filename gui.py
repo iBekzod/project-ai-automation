@@ -581,9 +581,23 @@ class App(tk.Tk):
     # ===== Closing =====
 
     def _on_close_to_tray(self):
-        """Window-close → hide to tray. Bot keeps running."""
+        """Window-close → hide to tray. Bot keeps running.
+
+        Show a one-time tray notification so the user knows the bot didn't
+        actually shut down — Windows users often expect 'X' to fully exit.
+        """
         self.withdraw()
-        # Optional one-time toast via the tray; keep it quiet to avoid spam.
+        if self._tray_icon and not getattr(self, "_tray_notified_once", False):
+            try:
+                self._tray_icon.notify(
+                    "Oyna yashirildi, lekin bot ishlashda davom etmoqda. "
+                    "Boshqarish uchun tray belgisini bosing.",
+                    APP_TITLE,
+                )
+                self._tray_notified_once = True
+            except Exception:  # noqa: BLE001
+                # notify() isn't supported on every platform — silent fallback.
+                pass
 
     def _real_quit(self):
         """Tray → Quit. Stops the bot, removes tray, destroys the window."""

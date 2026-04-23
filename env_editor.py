@@ -73,7 +73,14 @@ def ensure_env_file(env_path: Path) -> None:
 def read_env(env_path: Path) -> dict[str, str]:
     ensure_env_file(env_path)
     raw = dotenv_values(str(env_path))
-    return {k: (v or "") for k, v in raw.items()}
+    out = {k: (v or "") for k, v in raw.items()}
+    # Backward-compat migration: surface legacy singular TELEGRAM_DEVELOPER_ID
+    # in the new TELEGRAM_DEVELOPER_IDS slot if the latter is empty. Without
+    # this the GUI would render the new field blank for users with old .env
+    # files, and a Save would blank out their dev allow-list.
+    if not out.get("TELEGRAM_DEVELOPER_IDS") and out.get("TELEGRAM_DEVELOPER_ID"):
+        out["TELEGRAM_DEVELOPER_IDS"] = out["TELEGRAM_DEVELOPER_ID"]
+    return out
 
 
 def save_env(env_path: Path, values: dict[str, str]) -> None:

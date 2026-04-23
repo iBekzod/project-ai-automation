@@ -581,6 +581,16 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _apply_issue(ctx: ContextTypes.DEFAULT_TYPE, issue: Issue) -> None:
     """Run apply_fix + create_and_merge_pr for `issue`. DMs status to dev."""
+    # Multi-dev safety: if dev A already accepted this issue, dev B's tap
+    # would otherwise re-run apply_fix and explode on `git checkout -b
+    # fix/bot-<id>` (branch exists). Refuse politely instead.
+    if issue.branch is not None:
+        await _dm_all_devs(
+            ctx,
+            f"{issue.id} avval qo'llangan ({issue.branch}). "
+            + ("stage'ga merge qilingan." if issue.merged_to_stage else "PR ochiq."),
+        )
+        return
     try:
         files = issue.diagnosis.get("files_to_change") or {}
         if not files:
