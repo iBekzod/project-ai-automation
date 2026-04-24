@@ -1679,6 +1679,78 @@ async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     updater.restart_bot()
 
 
+async def cmd_autoupdate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """`/autoupdate [on|off|status|hours <N>|apply on|apply off]` — manage
+    the periodic GitHub poll without touching the DB directly.
+
+    Examples:
+      /autoupdate              → show current state
+      /autoupdate on           → poll every 6 h (default), notify only
+      /autoupdate off          → disable periodic poll
+      /autoupdate hours 12     → poll every 12 hours
+      /autoupdate apply on     → also auto-pull + restart on new version
+      /autoupdate apply off    → notify only (don't auto-apply)
+    """
+    if not config.is_developer(update.effective_user.id):
+        return
+    args = list(ctx.args or [])
+
+    if not args or args[0].lower() == "status":
+        h = updater.check_interval_seconds() // 3600 if updater.check_interval_seconds() else 0
+        on = "yoqilgan" if h > 0 else "o'chirilgan"
+        applying = "yoqilgan" if updater.auto_apply_enabled() else "o'chirilgan"
+        await _safe_md_send(
+            update.effective_message.reply_text,
+            "♻️ *Auto-update holati*\n\n"
+            f"Periodik tekshirish: *{on}*"
+            + (f" (har `{h}` soatda)" if h else "") + "\n"
+            f"Avto-yangilash: *{applying}*\n\n"
+            "Sozlash:\n"
+            "`/autoupdate on` — yoqish (har 6 soatda)\n"
+            "`/autoupdate hours 12` — interval (soatda)\n"
+            "`/autoupdate apply on` — avto-pull + qayta ishga tushish\n"
+            "`/autoupdate off` — to'liq o'chirish",
+        )
+        return
+
+    cmd = args[0].lower()
+    if cmd == "on":
+        db.set_setting("update_check_hours", "6", updated_by=update.effective_user.id)
+        await update.effective_message.reply_text(
+            "✅ Periodik tekshirish yoqildi (har 6 soatda)."
+        )
+        return
+    if cmd == "off":
+        db.set_setting("update_check_hours", "0", updated_by=update.effective_user.id)
+        db.set_setting("update_auto_apply", "false", updated_by=update.effective_user.id)
+        await update.effective_message.reply_text(
+            "✅ Auto-update to'liq o'chirildi. /version va /update qo'lda ishlaydi."
+        )
+        return
+    if cmd == "hours" and len(args) >= 2:
+        try:
+            h = max(0, int(args[1]))
+        except ValueError:
+            await update.effective_message.reply_text("Noto'g'ri qiymat. Misol: `/autoupdate hours 12`")
+            return
+        db.set_setting("update_check_hours", str(h), updated_by=update.effective_user.id)
+        await update.effective_message.reply_text(
+            f"✅ Tekshirish oraligi: {h} soat" + (" (o'chirilgan)" if h == 0 else "")
+        )
+        return
+    if cmd == "apply" and len(args) >= 2:
+        on = args[1].lower() in ("on", "true", "1", "yes")
+        db.set_setting("update_auto_apply", "true" if on else "false", updated_by=update.effective_user.id)
+        await update.effective_message.reply_text(
+            "✅ Avto-yangilash " + ("yoqildi" if on else "o'chirildi")
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "Foydalanish: `/autoupdate [on|off|status|hours N|apply on|apply off]`"
+    )
+
+
 async def cmd_projects(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """`/projects` — read-only inspector for the projects/repos/group-links DB."""
     if not config.is_developer(update.effective_user.id):
@@ -2084,8 +2156,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("help",     cmd_help))
     app.add_handler(CommandHandler("status",   cmd_status))
     app.add_handler(CommandHandler("projects", cmd_projects))
-    app.add_handler(CommandHandler("version",  cmd_version))
-    app.add_handler(CommandHandler("update",   cmd_update))
+    app.add_handler(CommandHandler("version",    cmd_version))
+    app.add_handler(CommandHandler("update",     cmd_update))
+    app.add_handler(CommandHandler("autoupdate", cmd_autoupdate))
     app.add_handler(CommandHandler("chat",     cmd_chat))
     app.add_handler(CommandHandler("chatlist", cmd_chatlist))
     app.add_handler(CommandHandler("stop",     cmd_stop))

@@ -86,17 +86,28 @@ tasniflanadi.
 - **GUI Logs tab** — jonli oqim.
 - **`bot.db`** (SQLite) — strukturali audit jurnali (`actions` jadvali) + ochiq muammolar + chat sessiyalari + pending tasklar bot qayta ishga tushganda yo'qolmaydi. WAL mode + qisqa muddatli connectionlar — concurrent_updates bilan to'qnashmaydi.
 
-### ♻️ Auto-update (GitHub'dan avtomatik yangilanish)
-- Har bir colleague botni `git clone` qilib o'rnatganda ishlaydi.
-- Har 6 soatda (sozlanadigan) GitHub API orqali `origin/<branch>` ni tekshiradi.
-- Yangi commit topilsa: barcha dasturchilarga DM yuboradi: *"🆙 Yangi versiya: `abc1234` — message"*.
-- `/update` — qo'lda yangilash (git pull + qayta ishga tushish). Hozir tahlil ishlamayotgan bo'lsa, faqat shunda davom etadi (`ONGOING_ACKS` bo'sh).
-- `/version` — joriy mahalliy va GitHub commitlarini ko'rsatadi + auto rejimning holati.
-- Avto-yangilash sozlamalari `bot.db` ning `settings` jadvalida:
-  - `update_repo_api` — GitHub API URL (default: `https://api.github.com/repos/iBekzod/project-ai-automation`)
-  - `update_branch` — kuzatiladigan branch (default: `main`)
-  - `update_check_hours` — tekshirish oraligi (default: `6`, `0` o'chiradi)
-  - `update_auto_apply` — `true` bo'lsa, yangi versiya topilsa avtomatik pull + restart qiladi (default: `false` — faqat ogohlantirish)
+### ♻️ Auto-update (ixtiyoriy — default o'chirilgan)
+Botni `git clone` qilib o'rnatganda hech qachon o'z-o'zidan GitHub'ga
+murojaat qilmaydi — auto-update faqat yoqilganda ishlaydi.
+
+**Qo'lda buyruqlar (har doim mavjud):**
+- `/version` — mahalliy va GitHub'dagi commit'larni ko'rsatadi
+- `/update` — git pull + bot qayta ishga tushish (hozir tahlil
+  ishlamayotgan bo'lsa)
+
+**Periodik tekshirishni yoqish (ixtiyoriy):**
+- `/autoupdate on` — har 6 soatda tekshirib, yangi versiya bo'lsa DM
+  yuboradi
+- `/autoupdate hours 12` — boshqa interval (soatda)
+- `/autoupdate apply on` — yangi versiya topilsa avtomatik pull + restart
+- `/autoupdate off` — periodik va avto-apply'ni to'liq o'chirish
+- `/autoupdate status` — joriy holatni ko'rsatish
+
+Sozlamalar `bot.db` ning `settings` jadvalida:
+- `update_repo_api` — GitHub API URL (default: `https://api.github.com/repos/iBekzod/project-ai-automation`)
+- `update_branch` — kuzatiladigan branch (default: `main`)
+- `update_check_hours` — tekshirish oraligi (default: `0` — o'chirilgan)
+- `update_auto_apply` — `true` bo'lsa avto-pull + restart (default: `false`)
 
 ### 🖥 Desktop GUI (zamonaviy)
 Win11-style **Sun Valley** mavzusi bilan Tkinter ilova:

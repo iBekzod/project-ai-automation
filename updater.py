@@ -32,7 +32,10 @@ log = logging.getLogger(__name__)
 
 DEFAULT_REPO_API = "https://api.github.com/repos/iBekzod/project-ai-automation"
 DEFAULT_BRANCH = "main"
-DEFAULT_CHECK_HOURS = 6
+# 0 = no periodic GitHub poll. /version and /update still work on demand.
+# Colleagues opt in by setting `update_check_hours` > 0 in the settings table
+# (or via /autoupdate on).
+DEFAULT_CHECK_HOURS = 0
 DEFAULT_AUTO_APPLY = False
 
 
