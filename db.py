@@ -171,6 +171,22 @@ CREATE TABLE IF NOT EXISTS developers (
 """
 
 
+def _add_column_if_missing(
+    conn: sqlite3.Connection, table: str, col: str, decl: str,
+) -> None:
+    """SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`. Emulate it."""
+    existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if col not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        log.info("schema: added %s.%s", table, col)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Forward-only column additions for existing DBs."""
+    _add_column_if_missing(conn, "issues", "project_id", "TEXT")
+    _add_column_if_missing(conn, "issues", "repo_role",  "TEXT")
+
+
 def init() -> None:
     """Open / create the DB and apply schema. Safe to call multiple times."""
     global _db_path, _initialized
@@ -180,6 +196,7 @@ def init() -> None:
         _db_path = config.ENV_FILE.parent / "bot.db"
         with _connect() as conn:
             conn.executescript(_SCHEMA_SQL)
+            _migrate(conn)
         _initialized = True
         log.info("sqlite ready at %s", _db_path)
 
@@ -269,12 +286,14 @@ def save_issue(issue: dict) -> None:
     with _connect() as conn:
         conn.execute(
             """INSERT INTO issues(
-                id, project, group_id, group_title, user_message_id,
-                message, diagnosis_json, category, branch, pr_url,
-                merged_to_stage, awaiting_retry, retry_initiator
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                id, project, project_id, repo_role, group_id, group_title,
+                user_message_id, message, diagnosis_json, category, branch,
+                pr_url, merged_to_stage, awaiting_retry, retry_initiator
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 project=excluded.project,
+                project_id=excluded.project_id,
+                repo_role=excluded.repo_role,
                 group_title=excluded.group_title,
                 message=excluded.message,
                 diagnosis_json=excluded.diagnosis_json,
@@ -288,6 +307,8 @@ def save_issue(issue: dict) -> None:
             (
                 issue["id"],
                 issue.get("project"),
+                issue.get("project_id"),
+                issue.get("repo_role"),
                 issue.get("group_id"),
                 issue.get("group_title"),
                 issue.get("user_message_id"),
@@ -323,9 +344,12 @@ def close_issue(issue_id: str) -> None:
 
 def _row_to_issue(row: sqlite3.Row) -> dict:
     """Hydrate a row back into the dict shape that mirrors the Issue dataclass."""
+    keys = row.keys()
     return {
         "id":                    row["id"],
         "project":               row["project"],
+        "project_id":            row["project_id"] if "project_id" in keys else None,
+        "repo_role":             row["repo_role"] if "repo_role" in keys else None,
         "group_id":              row["group_id"],
         "group_title":           row["group_title"],
         "user_message_id":       row["user_message_id"],

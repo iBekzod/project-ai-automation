@@ -193,8 +193,12 @@ def _build_format_prompt(investigation: str) -> str:
     return FORMAT_PROMPT_HEAD + investigation + FORMAT_PROMPT_TAIL
 
 
-def run_claude(prompt: str, timeout: int | None = None) -> str:
-    """Invoke `claude --print` in REPO_PATH and return stdout.
+def run_claude(
+    prompt: str,
+    timeout: int | None = None,
+    cwd_override: str | None = None,
+) -> str:
+    """Invoke `claude --print` and return stdout.
 
     The prompt is piped via STDIN rather than passed on the command line.
     Reasons:
@@ -203,13 +207,18 @@ def run_claude(prompt: str, timeout: int | None = None) -> str:
         arrived at Claude with their embedded investigation body missing).
       * stdin sidesteps argv length limits, quoting rules, and newline escaping.
       * Reads config.* each call so Settings → Save → Start reflects new values.
+
+    `cwd_override` (optional): when set, Claude runs in that directory
+    instead of `config.REPO_PATH`. Used by the multi-project router so
+    each repo's own CLAUDE.md / .ruflo agents are picked up.
     """
     cli_setting = config.CLAUDE_CLI
     cli = _resolve_cli(cli_setting)
     effective_timeout = timeout or config.CLAUDE_TIMEOUT
+    cwd = cwd_override or str(config.REPO_PATH)
     log.info(
         "invoking claude (%s, prompt=%d chars via stdin, cwd=%s)",
-        cli, len(prompt), config.REPO_PATH,
+        cli, len(prompt), cwd,
     )
     try:
         result = subprocess.run(
@@ -217,7 +226,7 @@ def run_claude(prompt: str, timeout: int | None = None) -> str:
             input=prompt,
             capture_output=True,
             text=True,
-            cwd=str(config.REPO_PATH),
+            cwd=cwd,
             timeout=effective_timeout,
             encoding="utf-8",
             errors="replace",
@@ -318,19 +327,17 @@ def _normalize_diagnosis(data: dict) -> dict:
 
 CLASSIFIER_TIMEOUT = 120  # seconds — classifier must stay snappy
 
+# The scope section is built dynamically from the DB at call time so it always
+# reflects the current set of projects + repos + descriptions.
 CLASSIFIER_PROMPT_TEMPLATE = """You are a fast classifier for a Telegram support bot.
 
-PROJECT SCOPE — this bot only helps with bugs in the "Xonsaroy" Laravel 11 backend API:
-- Real-estate management: apartments, buildings, bookings, clients
-- Contract scanning / OCR / AI signature and field extraction
-- Orders, payments, payment history
-- V4 REST API (/api/v4/...)
-- Telegram bot notifications emitted BY the backend
-- Queue workers, supervisor, scheduled jobs, backend-side integrations
+The bot manages these projects (each with one or more code repos):
+
+{scope}
 
 NOT covered by this bot:
-- Frontend / mobile app / Flutter UI / web CSS / HTML
-- Infrastructure: Kubernetes, deployment, nginx, server, DB admin, disk/CPU
+- Anything outside the projects/repos listed above
+- Pure infrastructure issues (Kubernetes, deployment, server, nginx, DB admin, disk/CPU) — those belong to ops, not code fixes
 - Non-software: HR, workflow, sales, scheduling
 
 MESSAGE:
@@ -339,44 +346,86 @@ MESSAGE:
 >>>
 {image_note}
 Classify into exactly ONE of:
-- OUR_PROBLEM   — complaint about a bug in the Xonsaroy backend scope above
-- OUT_OF_SCOPE  — real complaint but NOT in our scope (frontend, infra, other system)
+- OUR_PROBLEM   — complaint about a bug in one of the listed projects/repos
+- OUT_OF_SCOPE  — real complaint but NOT in any of our projects (e.g. infra, third-party system, frontend not listed above)
 - CHAT          — casual chat, greeting, acknowledgment, joke, status, off-topic
 
 Languages you may see: Uzbek (Latin), Russian, English, mixed.
 
+If OUR_PROBLEM, ALSO identify which project the issue belongs to AND which
+repo within that project. The project_id and repo_role values are taken
+EXACTLY from the list above. Use 'none' for both if not OUR_PROBLEM.
+
 Guidance:
-- A screenshot of a 500 error / stacktrace / API response → OUR_PROBLEM.
-- A screenshot of a mobile app UI glitch or web styling issue → OUT_OF_SCOPE.
-- Vague complaint ("ishlamayapti") with no context → lean OUR_PROBLEM if it mentions anything backend (API, data, contract, order, payment); lean OUT_OF_SCOPE if it's clearly about a screen/button.
-- If genuinely unsure between OUR_PROBLEM and OUT_OF_SCOPE, choose OUR_PROBLEM — dev can reclassify.
-- Never choose CHAT if the message describes something not working, even casually.
+- A 500 error / stacktrace / API response screenshot → usually a backend repo.
+- A mobile-app UI glitch screenshot → mobile repo if one exists, else OUT_OF_SCOPE.
+- A web admin panel glitch → frontend / admin repo if one exists.
+- Vague complaint ("ishlamayapti") + no context → lean OUR_PROBLEM with the
+  project that best matches the group's typical traffic; dev can reclassify.
+- Never choose CHAT if the message describes something not working.
 
-Reply with EXACTLY this shape (no code fences, no prose before it):
-VERDICT: OUR_PROBLEM
+Reply EXACTLY in this shape (no code fences, no prose before it):
+VERDICT: OUR_PROBLEM | OUT_OF_SCOPE | CHAT
+PROJECT: <project_id> | none
+REPO: <repo_role> | none
 REASON: <one short Uzbek Latin sentence>
-
-(or VERDICT: OUT_OF_SCOPE / VERDICT: CHAT with matching REASON)
 """
+
+
+def _build_scope_section(chat_id: int | None) -> str:
+    """Render every (project, repo) the group can see, for the classifier prompt.
+
+    If the group is not linked to any project, all projects are listed (open
+    config) — useful before the link table is populated. If no projects exist
+    at all, returns a placeholder so Claude can still classify CHAT vs other.
+    """
+    try:
+        import db as _db
+        if _db._db_path is None:
+            return "(no projects configured yet)"
+        projects = _db.projects_for_group(chat_id) if chat_id is not None else []
+        if not projects:
+            projects = _db.list_projects()
+        if not projects:
+            return "(no projects configured yet)"
+        out: list[str] = []
+        for p in projects:
+            head = f"=== Project: {p['id']} — {p['name']} ==="
+            out.append(head)
+            if p.get("description"):
+                out.append(f"Description: {p['description']}")
+            for r in _db.list_repos(p["id"]):
+                line = f"  - repo '{r['role']}': {r.get('label') or r['github_repo']}"
+                out.append(line)
+                if r.get("description"):
+                    out.append(f"    Scope: {r['description']}")
+            out.append("")
+        return "\n".join(out)
+    except Exception:  # noqa: BLE001
+        log.exception("could not build classifier scope section")
+        return "(scope unavailable — DB read failed; treat as single-project bot)"
 
 
 def classify_via_claude(
     text: str,
     image_paths: list[str] | None = None,
-) -> tuple[bool, str]:
-    """Stage 1 classifier — ask Claude if the message is a problem report.
+    chat_id: int | None = None,
+) -> tuple[bool, str | None, str | None, str]:
+    """Stage 1 classifier — ask Claude if the message is a problem report,
+    and if so, which project and repo it belongs to.
 
-    Runs in the bot's own directory (not REPO_PATH), so Claude does NOT load
-    CLAUDE.md or search the 107-module Laravel repo — keeping this call cheap
-    (~10-15s). Uses its own short timeout so a stalled classifier doesn't
-    block a real complaint for 15 minutes.
+    Runs in the bot directory (no CLAUDE.md, no repo search) with a short
+    timeout. Returns (is_problem, project_id, repo_role, reason). Both
+    project_id and repo_role are None for CHAT/OUT_OF_SCOPE.
 
-    Returns (is_problem, reason). On any failure, defaults to (True, ...) —
-    we'd rather run Stage 2 on a chat message than miss a real problem.
+    On any failure defaults to (True, None, None, ...) — better to run Stage
+    2 on a borderline message than silently drop a real problem. Stage 2's
+    routing logic falls back to the bootstrap 'main' project / 'backend' repo
+    when project/repo are None.
     """
     text = (text or "").strip()
     if not text and not image_paths:
-        return (False, "empty_message")
+        return (False, None, None, "empty_message")
 
     image_note = ""
     if image_paths:
@@ -387,6 +436,7 @@ def classify_via_claude(
         )
 
     prompt = CLASSIFIER_PROMPT_TEMPLATE.format(
+        scope=_build_scope_section(chat_id),
         message=text[:800] if text else "(no text — screenshot only)",
         image_note=image_note,
     )
@@ -410,52 +460,68 @@ def classify_via_claude(
         )
     except FileNotFoundError:
         log.warning("stage1 classifier: claude CLI not found; defaulting to PROBLEM")
-        return (True, "classifier_cli_missing")
+        return (True, None, None, "classifier_cli_missing")
     except subprocess.TimeoutExpired:
         log.warning(
             "stage1 classifier timed out after %ss; defaulting to PROBLEM",
             CLASSIFIER_TIMEOUT,
         )
-        return (True, "classifier_timeout")
+        return (True, None, None, "classifier_timeout")
     except Exception as exc:  # noqa: BLE001
         log.warning("stage1 classifier failed (%s); defaulting to PROBLEM", exc)
-        return (True, "classifier_error")
+        return (True, None, None, "classifier_error")
 
     if result.returncode != 0:
         log.warning(
             "stage1 classifier exit %d: %s",
             result.returncode, (result.stderr or "")[:200],
         )
-        return (True, "classifier_nonzero_exit")
+        return (True, None, None, "classifier_nonzero_exit")
 
     out = (result.stdout or "").strip()
     if not out:
-        return (True, "classifier_empty_output")
+        return (True, None, None, "classifier_empty_output")
 
     verdict_line = ""
+    project_line = ""
+    repo_line = ""
     reason_line = ""
     for line in out.splitlines():
         s = line.strip()
-        if s.upper().startswith("VERDICT:") and not verdict_line:
+        u = s.upper()
+        if u.startswith("VERDICT:") and not verdict_line:
             verdict_line = s
-        elif s.upper().startswith("REASON:") and not reason_line:
+        elif u.startswith("PROJECT:") and not project_line:
+            project_line = s
+        elif u.startswith("REPO:") and not repo_line:
+            repo_line = s
+        elif u.startswith("REASON:") and not reason_line:
             reason_line = s
     verdict_upper = verdict_line.upper()
-    reason = (reason_line.split(":", 1)[1].strip() if ":" in reason_line else "")[:120]
+
+    def _strip_field(line: str) -> str:
+        return (line.split(":", 1)[1].strip() if ":" in line else "")[:120]
+
+    project = _strip_field(project_line) or None
+    repo = _strip_field(repo_line) or None
+    if project and project.lower() in ("none", "n/a", "-"):
+        project = None
+    if repo and repo.lower() in ("none", "n/a", "-"):
+        repo = None
+    reason = _strip_field(reason_line)
 
     if "OUR_PROBLEM" in verdict_upper:
-        return (True, f"our_problem: {reason}" if reason else "our_problem")
+        return (True, project, repo, f"our_problem: {reason}" if reason else "our_problem")
     if "OUT_OF_SCOPE" in verdict_upper:
-        return (False, f"out_of_scope: {reason}" if reason else "out_of_scope")
+        return (False, None, None, f"out_of_scope: {reason}" if reason else "out_of_scope")
     if "CHAT" in verdict_upper:
-        return (False, f"chat: {reason}" if reason else "chat")
-    # Older PROBLEM/CHAT responses still handled as a safety net.
+        return (False, None, None, f"chat: {reason}" if reason else "chat")
+    # Legacy PROBLEM/CHAT responses still handled as a safety net.
     if "PROBLEM" in verdict_upper:
-        return (True, f"our_problem(legacy): {reason}" if reason else "our_problem")
+        return (True, project, repo, f"our_problem(legacy): {reason}" if reason else "our_problem")
 
-    # Malformed output — Claude didn't follow the format. Lean "proceed".
     log.warning("stage1 classifier unparseable verdict: %s", out[:200])
-    return (True, "classifier_unparseable")
+    return (True, None, None, "classifier_unparseable")
 
 
 # =============================================================================
@@ -699,6 +765,7 @@ def analyze(
     message: str,
     group: str,
     image_paths: list[str] | None = None,
+    repo_path_override: str | None = None,
 ) -> dict | None:
     """Return diagnosis dict with category+is_bug, or None when nothing parseable.
 
@@ -710,6 +777,10 @@ def analyze(
     "unclear" diagnosis that carries pass 1's narrative so the dev still sees
     Claude's work.
 
+    `repo_path_override` (optional): when set, Claude runs in that directory
+    instead of `config.REPO_PATH`. Used by the multi-project router so each
+    repo's own CLAUDE.md and `.ruflo/` are loaded.
+
     Returns a diagnosis for ALL classified categories (backend_bug,
     frontend_bug, infra_issue, user_error, unclear). The caller decides which
     categories trigger the fix pipeline.
@@ -719,7 +790,7 @@ def analyze(
         message=message,
         image_section=_image_section(image_paths),
     )
-    investigation = run_claude(prompt)
+    investigation = run_claude(prompt, cwd_override=repo_path_override)
     if not investigation:
         log.warning("claude investigation returned empty output")
         return None

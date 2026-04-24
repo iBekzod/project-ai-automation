@@ -118,6 +118,10 @@ class Issue:
     message: str
     user_message_id: int
     diagnosis: dict
+    # Routing — set by Stage 1 classifier (None means "fall back to default
+    # 'main' / 'backend' for backwards compat with single-project setups").
+    project_id: str | None = None
+    repo_role: str | None = None
     branch: str | None = None
     pr_url: str | None = None
     merged_to_stage: bool = False
@@ -167,6 +171,8 @@ def _hydrate_issues_from_db() -> None:
                 message=d.get("message") or "",
                 user_message_id=d.get("user_message_id") or 0,
                 diagnosis=d.get("diagnosis") or {},
+                project_id=d.get("project_id"),
+                repo_role=d.get("repo_role"),
                 branch=d.get("branch"),
                 pr_url=d.get("pr_url"),
                 merged_to_stage=bool(d.get("merged_to_stage")),
@@ -286,8 +292,14 @@ def _format_diagnosis(issue: Issue) -> str:
     msg = issue.message if len(issue.message) < 400 else issue.message[:400] + "..."
     cat = d.get("category") or "unclear"
     cat_label = CATEGORY_LABEL.get(cat, cat)
+    routing = ""
+    if issue.project_id or issue.repo_role:
+        proj = issue.project_id or "?"
+        role = issue.repo_role or "?"
+        routing = f"Loyiha: {proj} / {role}\n"
     return (
         f"Muammo {issue.id} — guruh: {issue.group_title}\n"
+        f"{routing}"
         f"Kategoriya: {cat_label}\n\n"
         f"Xodim yozdi: {msg}\n\n"
         f"Xulosa: {d.get('summary', '-')}\n"
@@ -319,6 +331,8 @@ async def _process_task(
     source_message_id: int,
     ack_message,
     image_paths: list[Path] | None = None,
+    project_id: str | None = None,
+    repo_role: str | None = None,
 ):
     """Run analyze() on `text` (+ optional image paths) and store an Issue.
 
@@ -327,17 +341,34 @@ async def _process_task(
     edit in place with the final category-specific verdict once analysis
     completes.
 
-    Group entry point only reaches this after Stage 1 classified OUR_PROBLEM,
-    so the ack is meaningful; DMs always get an ack since the dev sends tasks
-    intentionally.
+    Routing: if (project_id, repo_role) resolve to a known repo in the DB,
+    Stage 2 runs in that repo's `repo_path` (CLAUDE.md picked up from there).
+    Falls back to config.REPO_PATH for backwards compat.
 
     After analysis, attached images are deleted.
     """
     image_strs = [str(p) for p in (image_paths or [])]
+    repo_row = None
+    repo_path_override: str | None = None
+    if project_id and repo_role:
+        repo_row = db.get_repo(project_id, repo_role)
+        if repo_row and repo_row.get("repo_path"):
+            repo_path_override = repo_row["repo_path"]
+            log.info(
+                "stage2 routing → project=%s repo=%s cwd=%s",
+                project_id, repo_role, repo_path_override,
+            )
+        else:
+            log.warning(
+                "classifier suggested project=%s repo=%s but no matching repo "
+                "row in DB; falling back to default REPO_PATH",
+                project_id, repo_role,
+            )
     try:
         try:
             diagnosis = await run_capped(
                 analyze, text, source_chat_title, image_strs or None,
+                repo_path_override,
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("analyze failed")
@@ -358,6 +389,8 @@ async def _process_task(
             message=text,
             user_message_id=source_message_id,
             diagnosis=diagnosis,
+            project_id=project_id,
+            repo_role=repo_role,
         )
         ISSUES[issue_id] = new_issue
         _persist_issue(new_issue)
@@ -412,10 +445,14 @@ async def on_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # silently. The image is downloaded first so the classifier has the
     # screenshot signal.
     image_path = await _download_image(ctx, msg) if has_image else None
-    is_problem, reason = await run_capped(
+    # Classifier reads project/repo scope from the DB based on the chat_id
+    # so it knows which projects this group monitors and which repos belong
+    # to each. Returns 4-tuple (is_problem, project_id, repo_role, reason).
+    is_problem, classified_project, classified_repo, reason = await run_capped(
         classify_via_claude,
         text,
         [str(image_path)] if image_path else None,
+        msg.chat.id,
     )
     if not is_problem:
         _cleanup_image(image_path)
@@ -448,8 +485,9 @@ async def on_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # subsequent "boldi togrlandi" follow-up can supersede it.
     group_title = msg.chat.title or str(msg.chat.id)
     log.info(
-        "stage1 → our_problem (reason=%s); stage2 analysing msg in %s (image=%s): %s",
-        reason, group_title, has_image, text[:80] if text else "(no caption)",
+        "stage1 → our_problem (project=%s repo=%s reason=%s); stage2 analysing msg in %s (image=%s): %s",
+        classified_project, classified_repo, reason,
+        group_title, has_image, text[:80] if text else "(no caption)",
     )
 
     ack = await msg.reply_text("AI tahlil qilmoqda...")
@@ -467,6 +505,7 @@ async def on_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     task = asyncio.create_task(_process_task(
         ctx, effective_text, msg.chat.id, group_title, msg.message_id, ack,
         image_paths=[image_path] if image_path else None,
+        project_id=classified_project, repo_role=classified_repo,
     ))
     ongoing.task = task
     try:
@@ -1552,6 +1591,49 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_projects(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """`/projects` — read-only inspector for the projects/repos/group-links DB."""
+    if not config.is_developer(update.effective_user.id):
+        return
+    projects = db.list_projects()
+    if not projects:
+        await update.effective_message.reply_text(
+            "Loyihalar yo'q. Bot qayta ishga tushganda `.env`'dan avtomatik yaratiladi."
+        )
+        return
+    lines: list[str] = ["📁 *Loyihalar*", ""]
+    for p in projects:
+        lines.append(f"🌐 *{p['id']}* — {p['name']}")
+        if p.get("description"):
+            lines.append(f"  _{p['description']}_")
+        repos = db.list_repos(p["id"])
+        if repos:
+            lines.append("  *Repolar:*")
+            for r in repos:
+                role = r["role"]
+                ghr = r["github_repo"]
+                sb = r["stage_branch"]
+                pb = r["prod_branch"]
+                lines.append(f"    • `{role}` → `{ghr}` ({sb} → {pb})")
+                rp = r.get("repo_path") or "?"
+                lines.append(f"      📂 `{rp}`")
+                if r.get("description"):
+                    lines.append(f"      _{r['description']}_")
+        else:
+            lines.append("  _(repolar qo'shilmagan)_")
+        groups = db.groups_for_project(p["id"])
+        if groups:
+            lines.append("  *Guruhlar:* " + ", ".join(f"`{g}`" for g in groups))
+        lines.append("")
+    devs = db.list_developers()
+    if devs:
+        lines.append("👥 *Dasturchilar (DB):*")
+        for d in devs:
+            label = d.get("label") or "(yo'q)"
+            lines.append(f"  • `{d['user_id']}` — {label}")
+    await _safe_md_send(update.effective_message.reply_text, "\n".join(lines))
+
+
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """`/help` — full command reference."""
     user_id = update.effective_user.id
@@ -1577,7 +1659,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "`/push stage|dev|prod`\n"
         "\n"
         "*Holat*\n"
-        "`/status` · `/menu` · `/help` · `/ping` · `/whereami`\n"
+        "`/status` · `/projects` · `/menu` · `/help` · `/ping` · `/whereami`\n"
         "\n"
         "*Prefikslar* (DM free-text uchun)\n"
         "`!xabar` — TASK sifatida majburlash\n"
@@ -1847,6 +1929,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("menu",     cmd_menu))
     app.add_handler(CommandHandler("help",     cmd_help))
     app.add_handler(CommandHandler("status",   cmd_status))
+    app.add_handler(CommandHandler("projects", cmd_projects))
     app.add_handler(CommandHandler("chat",     cmd_chat))
     app.add_handler(CommandHandler("chatlist", cmd_chatlist))
     app.add_handler(CommandHandler("stop",     cmd_stop))
