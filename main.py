@@ -39,6 +39,7 @@ import chat_sessions
 import db
 import git_ops
 import github_ops
+import updater
 from bot_state import state as bot_state
 from claude_runner import (
     analyze,
@@ -1591,6 +1592,93 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_version(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """`/version` — show local + remote commits and whether an update is ready."""
+    if not config.is_developer(update.effective_user.id):
+        return
+    cur = updater.current_commit()
+    branch = updater.current_branch() or "?"
+    cur_short = (cur[:8] + "…") if cur else "(not a git clone)"
+
+    thinking = await update.effective_message.reply_text("📦 Tekshirilmoqda...")
+    try:
+        remote = await asyncio.to_thread(updater.latest_remote_commit)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("version check failed")
+        await thinking.edit_text(f"Tekshirib bo'lmadi: {exc}")
+        return
+
+    lines = [
+        "📦 *Bot versiya*",
+        "",
+        f"Mahalliy: `{cur_short}` (branch: `{branch}`)",
+    ]
+    if remote:
+        rem_short = remote["sha"][:8] + "…"
+        lines.append(f"GitHub:    `{rem_short}` — {remote['author']}")
+        lines.append(f"_{remote['message']}_")
+        if cur and remote["sha"] == cur:
+            lines.append("\n✅ Eng so'nggi versiyada.")
+        else:
+            lines.append("\n🆙 Yangi versiya mavjud — `/update` bilan yangilang.")
+    else:
+        lines.append("GitHub:    (tekshirib bo'lmadi)")
+    auto = "yoqilgan" if updater.auto_apply_enabled() else "o'chirilgan"
+    interval_h = (updater.check_interval_seconds() // 3600) if updater.check_interval_seconds() else 0
+    lines.append(
+        f"\nAvto-yangilash: *{auto}* · tekshirish oraligi: "
+        + (f"{interval_h} soat" if interval_h else "o'chirilgan")
+    )
+    await thinking.delete()
+    await _safe_md_send(update.effective_message.reply_text, "\n".join(lines))
+
+
+async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """`/update` — pull latest from GitHub and restart. Refuses if open issues."""
+    if not config.is_developer(update.effective_user.id):
+        return
+    if not updater.is_git_clone():
+        await update.effective_message.reply_text(
+            "Bu bot katalogi `.git`'ga ega emas — auto-update faqat `git clone` qilingan o'rnatishlarda ishlaydi."
+        )
+        return
+
+    # Safety: don't update mid-Accept-flow. Pending issues survive restart
+    # (they're in SQLite), so the only blocker is an in-flight Claude call
+    # we'd interrupt. We use ONGOING_ACKS as a proxy for "Stage 2 running".
+    if ONGOING_ACKS:
+        await update.effective_message.reply_text(
+            f"⚠️ {len(ONGOING_ACKS)} ta tahlil hozir ishlamoqda — avval tugashini kuting, keyin `/update` qiling.",
+        )
+        return
+
+    msg = await update.effective_message.reply_text("🔄 Yangilanmoqda...")
+    try:
+        ok, output = await asyncio.to_thread(updater.apply_update)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("apply_update threw")
+        await msg.edit_text(f"❌ Yangilash xato: {exc}")
+        return
+
+    if not ok:
+        truncated = output[:600]
+        await msg.edit_text(f"❌ Yangilash bajarilmadi:\n{truncated}")
+        return
+
+    truncated = (output or "").strip()[:600] or "(o'zgarish yo'q)"
+    await msg.edit_text(
+        f"✅ Yangilandi:\n{truncated}\n\n♻️ Qayta ishga tushirilmoqda...",
+    )
+    # Give Telegram a moment to deliver the edit before we kill ourselves.
+    await asyncio.sleep(2)
+    try:
+        await _dm_all_devs(ctx, "♻️ Bot qayta ishga tushdi.")
+    except Exception:  # noqa: BLE001
+        pass
+    await asyncio.sleep(1)
+    updater.restart_bot()
+
+
 async def cmd_projects(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """`/projects` — read-only inspector for the projects/repos/group-links DB."""
     if not config.is_developer(update.effective_user.id):
@@ -1869,6 +1957,71 @@ def validate_config():
         raise SystemExit(f"REPO_PATH does not exist: {config.REPO_PATH}")
 
 
+async def _post_init_start_periodic_jobs(app: Application) -> None:
+    """Spawn long-lived background tasks that need the asyncio loop.
+
+    Currently: the auto-update poller. Runs every `update_check_hours`,
+    DMs the dev list when a new commit is detected, and (if
+    `update_auto_apply` is true) pulls + restarts automatically.
+    """
+    asyncio.create_task(_auto_update_loop(app))
+
+
+async def _auto_update_loop(app: Application) -> None:
+    """Periodic GitHub poll → notify (and optionally apply) new versions."""
+    # Initial 5-min grace so logs settle and we don't paste an "update
+    # available" the moment a colleague starts up after pulling manually.
+    await asyncio.sleep(300)
+    while True:
+        try:
+            interval = updater.check_interval_seconds()
+            if interval <= 0:
+                await asyncio.sleep(3600)  # disabled — poll setting once per hour
+                continue
+            new = await asyncio.to_thread(updater.check_for_update)
+            if new:
+                short = new["sha"][:8]
+                msg = new["message"]
+                log.info("auto-updater: new version available %s — %s", short, msg)
+                if updater.auto_apply_enabled() and not ONGOING_ACKS:
+                    log.warning("auto-updater: auto-applying %s", short)
+                    ok, output = await asyncio.to_thread(updater.apply_update)
+                    if ok:
+                        text = f"♻️ Avto-yangilandi → `{short}`\n_{msg}_\nBot qayta ishga tushmoqda..."
+                        for dev_id in (config.TELEGRAM_DEVELOPER_IDS or []):
+                            try:
+                                await app.bot.send_message(
+                                    chat_id=dev_id, text=text, parse_mode="Markdown",
+                                )
+                            except Exception:  # noqa: BLE001
+                                log.exception("auto-update notice DM to %s failed", dev_id)
+                        await asyncio.sleep(2)
+                        updater.restart_bot()
+                    else:
+                        log.error("auto-updater: pull failed: %s", output[:200])
+                else:
+                    # Notify devs once per detected commit (re-detection on
+                    # next loop iteration is fine — just a duplicate notice
+                    # at most once per `interval`).
+                    text = (
+                        f"🆙 Yangi versiya: `{short}`\n_{msg}_\n\n"
+                        "`/update` bilan qo'lda yangilang, yoki `/version`'da avtomatikni yoqing."
+                    )
+                    for dev_id in (config.TELEGRAM_DEVELOPER_IDS or []):
+                        try:
+                            await app.bot.send_message(
+                                chat_id=dev_id, text=text, parse_mode="Markdown",
+                            )
+                        except Exception:  # noqa: BLE001
+                            log.exception("update notice DM to %s failed", dev_id)
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001
+            log.exception("auto-update loop iteration failed")
+            await asyncio.sleep(600)
+
+
 def build_app() -> Application:
     """Build the PTB Application with handlers wired up. Used by both CLI and GUI.
 
@@ -1921,6 +2074,7 @@ def build_app() -> Application:
         Application.builder()
         .token(config.TELEGRAM_BOT_TOKEN)
         .concurrent_updates(True)
+        .post_init(_post_init_start_periodic_jobs)
         .build()
     )
     app.add_handler(CommandHandler("start",    cmd_start))
@@ -1930,6 +2084,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("help",     cmd_help))
     app.add_handler(CommandHandler("status",   cmd_status))
     app.add_handler(CommandHandler("projects", cmd_projects))
+    app.add_handler(CommandHandler("version",  cmd_version))
+    app.add_handler(CommandHandler("update",   cmd_update))
     app.add_handler(CommandHandler("chat",     cmd_chat))
     app.add_handler(CommandHandler("chatlist", cmd_chatlist))
     app.add_handler(CommandHandler("stop",     cmd_stop))

@@ -86,6 +86,18 @@ tasniflanadi.
 - **GUI Logs tab** — jonli oqim.
 - **`bot.db`** (SQLite) — strukturali audit jurnali (`actions` jadvali) + ochiq muammolar + chat sessiyalari + pending tasklar bot qayta ishga tushganda yo'qolmaydi. WAL mode + qisqa muddatli connectionlar — concurrent_updates bilan to'qnashmaydi.
 
+### ♻️ Auto-update (GitHub'dan avtomatik yangilanish)
+- Har bir colleague botni `git clone` qilib o'rnatganda ishlaydi.
+- Har 6 soatda (sozlanadigan) GitHub API orqali `origin/<branch>` ni tekshiradi.
+- Yangi commit topilsa: barcha dasturchilarga DM yuboradi: *"🆙 Yangi versiya: `abc1234` — message"*.
+- `/update` — qo'lda yangilash (git pull + qayta ishga tushish). Hozir tahlil ishlamayotgan bo'lsa, faqat shunda davom etadi (`ONGOING_ACKS` bo'sh).
+- `/version` — joriy mahalliy va GitHub commitlarini ko'rsatadi + auto rejimning holati.
+- Avto-yangilash sozlamalari `bot.db` ning `settings` jadvalida:
+  - `update_repo_api` — GitHub API URL (default: `https://api.github.com/repos/iBekzod/project-ai-automation`)
+  - `update_branch` — kuzatiladigan branch (default: `main`)
+  - `update_check_hours` — tekshirish oraligi (default: `6`, `0` o'chiradi)
+  - `update_auto_apply` — `true` bo'lsa, yangi versiya topilsa avtomatik pull + restart qiladi (default: `false` — faqat ogohlantirish)
+
 ### 🖥 Desktop GUI (zamonaviy)
 Win11-style **Sun Valley** mavzusi bilan Tkinter ilova:
 - **📊 Dashboard** — bot holati, rejim/repo/guruhlar kartalari, to'liq konfiguratsiya
@@ -109,7 +121,8 @@ project-ai-automation/
 ├── main.py             # Telegram bot, command handlers, on_dm/on_group
 ├── claude_runner.py    # Claude CLI integratsiyasi (analyze, classify, chat)
 ├── chat_sessions.py    # Multi-session state — SQLite-backed
-├── db.py               # SQLite layer: schema, settings, actions, issues, chats
+├── db.py               # SQLite layer: schema, settings, actions, issues, chats, projects, repos
+├── updater.py          # Auto-update: GitHub API check, git pull, restart
 ├── bot_controller.py   # PTB lifecycle (Start/Stop/Pause/Resume)
 ├── bot_state.py        # Shared paused flag
 ├── git_ops.py          # apply_fix, push_to_branch, rollback_fix
