@@ -3,7 +3,7 @@
 # Build with:  pyinstaller XonsaroyBot.spec
 # The resulting exe lives in dist/XonsaroyBot/ (or dist/XonsaroyBot.exe for --onefile).
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
 hidden = []
 hidden += collect_submodules("telegram")
@@ -13,15 +13,21 @@ hidden += collect_submodules("pystray")  # platform backend (win32/gtk/...)
 hidden += collect_submodules("PIL")       # tray icon rendering
 hidden += ["dotenv", "dotenv.main", "sv_ttk"]
 
+# sv_ttk ships .tcl + .png theme files that PyInstaller does NOT auto-detect
+# from `import sv_ttk`. Without these the GUI would crash with "couldn't read
+# file 'sv.tcl'" when the bundled exe tries to apply the dark theme.
+datas = [
+    (".env.example", "."),
+]
+datas += collect_data_files("sv_ttk")
+
 block_cipher = None
 
 a = Analysis(
     ["gui.py"],
     pathex=["."],
     binaries=[],
-    datas=[
-        (".env.example", "."),
-    ],
+    datas=datas,
     hiddenimports=hidden,
     hookspath=[],
     hooksconfig={},
