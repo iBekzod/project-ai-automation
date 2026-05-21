@@ -590,15 +590,37 @@ class App(tk.Tk):
             var.set(chosen)
 
     def _on_start(self):
-        values = env_editor.read_env(config.ENV_FILE)
-        missing = env_editor.missing_required(values)
+        # Auto-persist whatever's in the Settings tab so "fill in → Start" just
+        # works without a separate Save click. Secrets → .env, runtime → DB.
+        try:
+            self._persist_settings()
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(APP_TITLE, f"Sozlamalarni saqlab bo'lmadi: {exc}")
+            self.nb.select(self.tab_settings)
+            return
+
+        # Validate the EFFECTIVE config (DB-backed settings + .env merged),
+        # not the raw .env file — REPO_PATH and friends now live in the DB.
+        missing: list[str] = []
+        if not config.TELEGRAM_BOT_TOKEN:
+            missing.append("Telegram bot token")
+        if not config.TELEGRAM_DEVELOPER_IDS:
+            missing.append("Developer Telegram IDs")
+        raw_repo = (config._resolved("REPO_PATH") or "").strip()
+        if not raw_repo:
+            missing.append("Local repo path (bo'sh)")
+        elif not Path(raw_repo).exists():
+            missing.append(f"Local repo path topilmadi:\n      {raw_repo}")
+
         if missing:
             messagebox.showerror(
                 APP_TITLE,
-                "Missing required settings:\n  • " + "\n  • ".join(missing),
+                "Quyidagi sozlamalar kerak:\n  • " + "\n  • ".join(missing)
+                + "\n\nSettings tab'da to'ldiring.",
             )
             self.nb.select(self.tab_settings)
             return
+
         ok, err = self.controller.start()
         if not ok:
             messagebox.showwarning(APP_TITLE, err or "could not start")
@@ -670,30 +692,34 @@ class App(tk.Tk):
             pass
         updater.restart_bot()
 
-    def _on_save_settings(self):
-        # .env section
+    def _persist_settings(self) -> None:
+        """Write Settings-tab values: secrets → .env, runtime → DB. No popup.
+
+        Raises on .env write failure so callers can surface it. Reloads
+        config at the end so DB-backed values take immediate effect.
+        """
         env_values = {k: v.get().strip() for k, v in self._env_entries.items()}
-        try:
-            env_editor.save_env(config.ENV_FILE, env_values)
-        except Exception as exc:
-            messagebox.showerror(APP_TITLE, f".env save failed: {exc}")
-            return
-        # DB section
+        env_editor.save_env(config.ENV_FILE, env_values)  # may raise
         for key, var in self._db_entries.items():
             db.set_setting(key, var.get().strip())
-        # Auto-update
         try:
             db.set_setting("update_check_hours", self._au_hours.get().strip() or "0")
             db.set_setting("update_auto_apply", self._au_apply.get())
             db.set_setting("update_branch", self._au_branch.get().strip() or "main")
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
-
         config.reload()
+
+    def _on_save_settings(self):
+        try:
+            self._persist_settings()
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(APP_TITLE, f"Saqlashda xato: {exc}")
+            return
         self._refresh_dashboard()
         msg = "Saqlandi."
         if self.controller.state in ("running", "paused"):
-            msg += " .env o'zgarishlari uchun Stop+Start tavsiya qilinadi."
+            msg += " O'zgarishlar uchun Stop+Start tavsiya qilinadi."
         messagebox.showinfo(APP_TITLE, msg)
 
     def _on_reload_settings(self):

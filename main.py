@@ -2024,9 +2024,15 @@ def validate_config():
         raise SystemExit(
             "Missing env var: TELEGRAM_DEVELOPER_IDS (or legacy TELEGRAM_DEVELOPER_ID)"
         )
-    _require("REPO_PATH", str(config.REPO_PATH))
-    if not config.REPO_PATH.exists():
-        raise SystemExit(f"REPO_PATH does not exist: {config.REPO_PATH}")
+    # Check the RAW configured REPO_PATH string, not config.REPO_PATH — when
+    # unset, Path("").resolve() collapses to the cwd (the exe's own folder),
+    # which .exists() would wrongly report True. config._resolved reads the
+    # DB-backed value first, then .env.
+    raw_repo = (config._resolved("REPO_PATH") or "").strip()
+    if not raw_repo:
+        raise SystemExit("Missing setting: REPO_PATH (set it in the GUI Settings tab)")
+    if not Path(raw_repo).exists():
+        raise SystemExit(f"REPO_PATH does not exist: {raw_repo}")
 
 
 async def _post_init_start_periodic_jobs(app: Application) -> None:
