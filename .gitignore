@@ -9,6 +9,7 @@ __pycache__/
 .vscode/
 *.log
 *.log.*
+*.stackdump
 tmp/
 chats.json
 chats.json.bak
