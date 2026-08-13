@@ -8,8 +8,10 @@ import os
 import re
 import shutil
 import subprocess
+import time
 
 import config
+import db
 
 log = logging.getLogger(__name__)
 
@@ -193,12 +195,42 @@ def _build_format_prompt(investigation: str) -> str:
     return FORMAT_PROMPT_HEAD + investigation + FORMAT_PROMPT_TAIL
 
 
+def _parse_envelope(stdout: str) -> tuple[str, dict | None]:
+    """Split a `--output-format json` response into (answer_text, envelope).
+
+    Falls back to (raw_stdout, None) when the payload is not the JSON envelope
+    we expect. That fallback is deliberate: an accounting change must never be
+    able to break the answer path. Losing one usage row is acceptable; losing a
+    diagnosis because the ledger could not parse something is not.
+    """
+    text = (stdout or "").strip()
+    if not text:
+        return "", None
+    try:
+        envelope = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return text, None
+    if not isinstance(envelope, dict):
+        return text, None
+    answer = envelope.get("result") or envelope.get("text") or ""
+    return (answer.strip() if isinstance(answer, str) else text), envelope
+
+
 def run_claude(
     prompt: str,
     timeout: int | None = None,
     cwd_override: str | None = None,
+    *,
+    kind: str = "analyze",
+    project_id: str | None = None,
+    repo_role: str | None = None,
+    issue_id: str | None = None,
 ) -> str:
-    """Invoke `claude --print` and return stdout.
+    """Invoke `claude --print` and return the answer text.
+
+    Runs with `--output-format json` so the cost/token block the CLI already
+    produces is captured instead of discarded — see db.claude_usage. The
+    RETURN VALUE is unchanged (the answer text), so callers need no edits.
 
     The prompt is piped via STDIN rather than passed on the command line.
     Reasons:
@@ -220,9 +252,15 @@ def run_claude(
         "invoking claude (%s, prompt=%d chars via stdin, cwd=%s)",
         cli, len(prompt), cwd,
     )
+    meta = {"project_id": project_id, "repo_role": repo_role, "issue_id": issue_id}
+    started = time.monotonic()
+
+    def _elapsed_ms() -> int:
+        return int((time.monotonic() - started) * 1000)
+
     try:
         result = subprocess.run(
-            [cli, "--print"],
+            [cli, "--print", "--output-format", "json"],
             input=prompt,
             capture_output=True,
             text=True,
@@ -241,6 +279,11 @@ def run_claude(
         raise
     except subprocess.TimeoutExpired:
         log.error("claude call timed out after %ss", effective_timeout)
+        # A timeout still consumed wall-clock and almost certainly tokens; the
+        # ledger has to show it, otherwise a repeatedly-timing-out prompt looks
+        # free right up until the bill arrives.
+        db.record_usage("timeout:" + kind, None, ok=False,
+                        duration_ms=_elapsed_ms(), **meta)
         return ""
 
     if result.returncode != 0:
@@ -250,10 +293,14 @@ def run_claude(
             (result.stderr or "")[:500],
             (result.stdout or "")[:200],
         )
+        db.record_usage(kind, None, ok=False, duration_ms=_elapsed_ms(), **meta)
         return ""
     if result.stderr:
         log.debug("claude stderr: %s", result.stderr[:500])
-    return (result.stdout or "").strip()
+
+    text, envelope = _parse_envelope(result.stdout or "")
+    db.record_usage(kind, envelope, ok=True, duration_ms=_elapsed_ms(), **meta)
+    return text
 
 
 def parse_json(text: str) -> dict:
@@ -447,9 +494,10 @@ def classify_via_claude(
         "stage1 classifier invoking claude (%s, prompt=%d chars, cwd=%s)",
         cli, len(prompt), classifier_cwd,
     )
+    _t0 = time.monotonic()
     try:
         result = subprocess.run(
-            [cli, "--print"],
+            [cli, "--print", "--output-format", "json"],
             input=prompt,
             capture_output=True,
             text=True,
@@ -466,6 +514,8 @@ def classify_via_claude(
             "stage1 classifier timed out after %ss; defaulting to PROBLEM",
             CLASSIFIER_TIMEOUT,
         )
+        db.record_usage("timeout:classify", None, ok=False,
+                        duration_ms=int((time.monotonic() - _t0) * 1000))
         return (True, None, None, "classifier_timeout")
     except Exception as exc:  # noqa: BLE001
         log.warning("stage1 classifier failed (%s); defaulting to PROBLEM", exc)
@@ -476,9 +526,15 @@ def classify_via_claude(
             "stage1 classifier exit %d: %s",
             result.returncode, (result.stderr or "")[:200],
         )
+        db.record_usage("classify", None, ok=False,
+                        duration_ms=int((time.monotonic() - _t0) * 1000))
         return (True, None, None, "classifier_nonzero_exit")
 
-    out = (result.stdout or "").strip()
+    # This is the call that fires on EVERY group message, so it is the one most
+    # likely to dominate the bill — measuring it is the whole point.
+    out, _envelope = _parse_envelope(result.stdout or "")
+    db.record_usage("classify", _envelope, ok=True,
+                    duration_ms=int((time.monotonic() - _t0) * 1000))
     if not out:
         return (True, None, None, "classifier_empty_output")
 
@@ -576,9 +632,10 @@ def classify_dm_intent(
     classifier_cwd = os.path.dirname(os.path.abspath(__file__))
     cli = _resolve_cli(config.CLAUDE_CLI)
     log.info("dm intent classifier invoking claude (prompt=%d chars)", len(prompt))
+    _t0 = time.monotonic()
     try:
         result = subprocess.run(
-            [cli, "--print"],
+            [cli, "--print", "--output-format", "json"],
             input=prompt,
             capture_output=True,
             text=True,
@@ -589,6 +646,8 @@ def classify_dm_intent(
         )
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         log.warning("dm intent classifier failed (%s); defaulting to CHAT", exc)
+        db.record_usage("timeout:classify_dm", None, ok=False,
+                        duration_ms=int((time.monotonic() - _t0) * 1000))
         return ("CHAT", "intent_classifier_error")
     except Exception as exc:  # noqa: BLE001
         log.warning("dm intent classifier subprocess err: %s", exc)
@@ -599,9 +658,13 @@ def classify_dm_intent(
             "dm intent classifier exit %d: %s",
             result.returncode, (result.stderr or "")[:200],
         )
+        db.record_usage("classify_dm", None, ok=False,
+                        duration_ms=int((time.monotonic() - _t0) * 1000))
         return ("CHAT", "intent_classifier_nonzero")
 
-    out = (result.stdout or "").strip()
+    out, _envelope = _parse_envelope(result.stdout or "")
+    db.record_usage("classify_dm", _envelope, ok=True,
+                    duration_ms=int((time.monotonic() - _t0) * 1000))
     verdict_line = ""
     reason_line = ""
     for line in out.splitlines():
@@ -728,11 +791,16 @@ def chat_with_claude(
         envelope = json.loads(stdout)
         text_out = envelope.get("result") or envelope.get("text") or ""
         new_sid = envelope.get("session_id") or envelope.get("sessionId")
+        # The cost block was already arriving here and being dropped on the
+        # floor. Chat turns are the long ones, so this is where a single
+        # runaway conversation shows up first.
+        db.record_usage("chat", envelope, ok=True)
         if new_sid and not session_id:
             return (text_out.strip() or "(bo'sh javob)", new_sid)
         return (text_out.strip() or "(bo'sh javob)", session_id)
     except json.JSONDecodeError:
         log.warning("chat: claude stdout not JSON; using raw text")
+        db.record_usage("chat", None, ok=False)
         return (stdout, session_id)
 
 

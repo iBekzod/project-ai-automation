@@ -168,6 +168,37 @@ CREATE TABLE IF NOT EXISTS developers (
     added_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     added_by  INTEGER
 );
+
+-- Per-call cost and token accounting for every Claude CLI invocation.
+--
+-- The CLI already returns this on every call (total_cost_usd + a usage block);
+-- until now the code parsed out the answer text and threw the rest away. This
+-- table is what makes the question "where is the budget going?" answerable at
+-- all — and every later decision (priority, caps, which agent to run) has to
+-- rest on it rather than on a guess.
+--
+-- Cache columns are kept separate on purpose: on this workload they dominate.
+-- A trivial call measured 2 input + 4 output tokens but 9,549 cache-creation
+-- tokens, because each invocation reloads CLAUDE.md and the project context.
+-- Lumping them into one "tokens" number would hide the actual cost driver.
+CREATE TABLE IF NOT EXISTS claude_usage (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind           TEXT NOT NULL,     -- classify | classify_dm | analyze | chat
+    project_id     TEXT,
+    repo_role      TEXT,
+    issue_id       TEXT,
+    cost_usd       REAL DEFAULT 0,
+    input_tokens         INTEGER DEFAULT 0,
+    output_tokens        INTEGER DEFAULT 0,
+    cache_creation_tokens INTEGER DEFAULT 0,
+    cache_read_tokens     INTEGER DEFAULT 0,
+    duration_ms    INTEGER DEFAULT 0,
+    num_turns      INTEGER DEFAULT 0,
+    ok             INTEGER DEFAULT 1, -- 0 = call failed / timed out
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_claude_usage_created ON claude_usage(created_at);
+CREATE INDEX IF NOT EXISTS idx_claude_usage_kind    ON claude_usage(kind, created_at);
 """
 
 
@@ -786,3 +817,92 @@ def bootstrap_from_env(
     for key, val in seed_pairs:
         if get_setting(key) is None:
             set_setting(key, val)
+
+
+# ============================================================================
+# claude_usage — har chaqiruvning sarfi
+# ============================================================================
+
+def record_usage(
+    kind: str,
+    envelope: dict | None,
+    *,
+    project_id: str | None = None,
+    repo_role: str | None = None,
+    issue_id: str | None = None,
+    ok: bool = True,
+    duration_ms: int = 0,
+) -> None:
+    """Store one Claude CLI call's cost/token usage.
+
+    `envelope` is the parsed `--output-format json` object. None means the call
+    failed before producing one (timeout, non-zero exit, unparseable stdout) —
+    the row is still written with ok=0, because a call that burned wall-clock
+    and produced nothing is exactly what a budget review needs to see. Silently
+    dropping failures would make the ledger look healthier than reality.
+
+    Never raises: accounting must not be able to break the thing it measures.
+    """
+    env = envelope or {}
+    usage = env.get("usage") or {}
+    try:
+        with _connect() as conn:
+            conn.execute(
+                """INSERT INTO claude_usage(
+                    kind, project_id, repo_role, issue_id, cost_usd,
+                    input_tokens, output_tokens,
+                    cache_creation_tokens, cache_read_tokens,
+                    duration_ms, num_turns, ok
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    kind,
+                    project_id,
+                    repo_role,
+                    issue_id,
+                    float(env.get("total_cost_usd") or 0.0),
+                    int(usage.get("input_tokens") or 0),
+                    int(usage.get("output_tokens") or 0),
+                    int(usage.get("cache_creation_input_tokens") or 0),
+                    int(usage.get("cache_read_input_tokens") or 0),
+                    int(env.get("duration_api_ms") or duration_ms or 0),
+                    int(env.get("num_turns") or 0),
+                    1 if ok else 0,
+                ),
+            )
+    except Exception:  # noqa: BLE001
+        log.exception("could not record claude usage (kind=%s)", kind)
+
+
+def usage_totals(hours: int = 24) -> dict:
+    """Rolling-window totals across all calls."""
+    with _connect() as conn:
+        row = conn.execute(
+            """SELECT
+                   COUNT(*)                      AS calls,
+                   COALESCE(SUM(cost_usd), 0)    AS cost_usd,
+                   COALESCE(SUM(input_tokens), 0)          AS input_tokens,
+                   COALESCE(SUM(output_tokens), 0)         AS output_tokens,
+                   COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+                   COALESCE(SUM(cache_read_tokens), 0)     AS cache_read_tokens,
+                   COALESCE(SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END), 0) AS failed
+               FROM claude_usage
+               WHERE created_at >= datetime('now', ?)""",
+            (f"-{int(hours)} hours",),
+        ).fetchone()
+        return dict(row) if row else {}
+
+
+def usage_by_kind(hours: int = 24) -> list[dict]:
+    """Same window, split by call kind — shows WHERE the budget goes."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT kind,
+                      COUNT(*)                   AS calls,
+                      COALESCE(SUM(cost_usd), 0) AS cost_usd
+               FROM claude_usage
+               WHERE created_at >= datetime('now', ?)
+               GROUP BY kind
+               ORDER BY cost_usd DESC""",
+            (f"-{int(hours)} hours",),
+        ).fetchall()
+        return [dict(r) for r in rows]
