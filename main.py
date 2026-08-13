@@ -43,6 +43,7 @@ import github_ops
 import updater
 from bot_state import state as bot_state
 import budget
+import team
 from claude_runner import (
     BudgetDenied,
     analyze,
@@ -404,7 +405,11 @@ async def _send_diagnosis_dm(ctx: ContextTypes.DEFAULT_TYPE, issue_id: str):
     issue = ISSUES[issue_id]
     cat = (issue.diagnosis.get("category") or "unclear")
     kb = _diagnosis_keyboard(issue_id) if cat == "backend_bug" else _retry_only_keyboard(issue_id)
-    await _dm_all_devs(ctx, _format_diagnosis(issue), reply_markup=kb)
+    # The diagnosis is engineering work, so it goes out in the voice of
+    # whoever owns that repo — backend vs frontend is already decided by the
+    # classifier's repo routing, so the label costs nothing extra.
+    speaker = team.for_repo_role(issue.repo_role).key if cat == "backend_bug" else "pm"
+    await _dm_all_devs(ctx, team.say(speaker, _format_diagnosis(issue)), reply_markup=kb)
 
 
 # ---------- handlers ----------
@@ -879,14 +884,15 @@ async def _apply_issue(ctx: ContextTypes.DEFAULT_TYPE, issue: Issue) -> None:
         await set_issue_stage(ctx.bot, issue, "testing" if merged else "awaiting")
 
         status = "stage'ga birlashtirildi" if merged else "PR ochildi (avto-merge bajarilmadi)"
+        # Branch/PR/merge is DevOps work — Muhammadjon's step.
         await _dm_all_devs(
             ctx,
-            f"{issue.id}: {status}\n{pr_url}",
+            team.say("devops", f"{issue.id}: {status}\n{pr_url}"),
             reply_markup=_publish_keyboard(issue.id) if merged else None,
         )
     except Exception as exc:  # noqa: BLE001
         log.exception("apply_fix failed")
-        await _dm_all_devs(ctx, f"{issue.id} qo'llanmadi: {exc}")
+        await _dm_all_devs(ctx, team.say("devops", f"{issue.id} qo'llanmadi: {exc}"))
 
 
 async def _publish_issue(ctx: ContextTypes.DEFAULT_TYPE, issue: Issue) -> None:
@@ -895,7 +901,7 @@ async def _publish_issue(ctx: ContextTypes.DEFAULT_TYPE, issue: Issue) -> None:
         ok = await asyncio.to_thread(git_ops.merge_to_prod)
     except Exception as exc:  # noqa: BLE001
         log.exception("publish failed")
-        await _dm_all_devs(ctx, f"{issue.id} chiqarish bajarilmadi: {exc}")
+        await _dm_all_devs(ctx, team.say("devops", f"{issue.id} chiqarish bajarilmadi: {exc}"))
         return
 
     if ok:
@@ -917,7 +923,7 @@ async def _publish_issue(ctx: ContextTypes.DEFAULT_TYPE, issue: Issue) -> None:
                 log.exception("could not notify group %s", issue.group_id)
         await _dm_all_devs(
             ctx,
-            f"{issue.id} {config.PROD_BRANCH} shoxobchasiga chiqarildi.",
+            team.say("devops", f"{issue.id} chiqarildi ({config.PROD_BRANCH})."),
         )
         _drop_issue(issue.id)
     else:
@@ -1566,6 +1572,13 @@ async def cmd_retry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     latest.diagnosis = new_diag
     _persist_issue(latest)
     await _send_diagnosis_dm(ctx, latest.id)
+
+
+async def cmd_team(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """`/team` — who is on the AI team and which step each one owns."""
+    if not config.is_developer(update.effective_user.id):
+        return
+    await update.effective_message.reply_text(team.roster())
 
 
 async def cmd_budget(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2372,6 +2385,7 @@ def build_app() -> Application:
         ("help", cmd_help),
         ("status", cmd_status),
         ("budget", cmd_budget),
+        ("team", cmd_team),
         ("projects", cmd_projects),
         ("version", cmd_version),
         ("update", cmd_update),
