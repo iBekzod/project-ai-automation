@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import time
 
+import budget
 import config
 import db
 
@@ -38,13 +39,36 @@ def _get_parallel_sem() -> asyncio.Semaphore:
     return _parallel_sem
 
 
-async def run_capped(fn, *args, **kwargs):
-    """Wrapper around asyncio.to_thread that respects MAX_PARALLEL_CLAUDE.
+class BudgetDenied(RuntimeError):
+    """Raised when the budget gate refuses a call. Carries the reason."""
 
-    Every Claude CLI invocation — analyze, classify_via_claude, classify_dm_intent,
-    chat_with_claude, run_claude — should be dispatched through this so that
-    parallel chats can't spawn an unbounded pile of `claude.exe` processes.
+    def __init__(self, decision):
+        super().__init__(decision.reason)
+        self.decision = decision
+
+
+async def run_capped(fn, *args, priority: str = budget.NORMAL, _kind: str = "", **kwargs):
+    """Dispatch a Claude call: budget gate first, then the concurrency cap.
+
+    Every Claude CLI invocation — analyze, classify_via_claude,
+    classify_dm_intent, chat_with_claude, run_claude — goes through here. That
+    makes it the one place where "should we spend this?" can be asked, which is
+    exactly why the policy lives here rather than at each call site: four call
+    sites means four chances to forget the fifth.
+
+    Order matters. The budget check happens BEFORE the semaphore, so a denied
+    call does not sit in the queue holding a slot it was never going to use.
+
+    Raises BudgetDenied when refused. Callers decide what that means — the
+    group classifier treats it as "assume it is a problem, let a human look",
+    which is the safe direction: we would rather over-report than silently
+    swallow a complaint because the month was expensive.
     """
+    kind = _kind or getattr(fn, "__name__", "unknown")
+    decision = budget.check(kind, priority)
+    if not decision.allowed:
+        raise BudgetDenied(decision)
+
     sem = _get_parallel_sem()
     async with sem:
         return await asyncio.to_thread(fn, *args, **kwargs)

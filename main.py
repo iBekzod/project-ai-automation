@@ -42,7 +42,9 @@ import git_ops
 import github_ops
 import updater
 from bot_state import state as bot_state
+import budget
 from claude_runner import (
+    BudgetDenied,
     analyze,
     analyze_with_instruction,
     chat_with_claude,
@@ -541,12 +543,25 @@ async def on_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Classifier reads project/repo scope from the DB based on the chat_id
     # so it knows which projects this group monitors and which repos belong
     # to each. Returns 4-tuple (is_problem, project_id, repo_role, reason).
-    is_problem, classified_project, classified_repo, reason = await run_capped(
-        classify_via_claude,
-        text,
-        [str(image_path)] if image_path else None,
-        msg.chat.id,
-    )
+    # LOW priority: this fires on EVERY group message, including "rahmat" and
+    # "ok". It is the only spend nobody asked for, so it is the first thing the
+    # budget gate drops. If it is refused we assume PROBLEM — over-reporting is
+    # the safe direction; silently swallowing a complaint because the month was
+    # expensive is not.
+    try:
+        is_problem, classified_project, classified_repo, reason = await run_capped(
+            classify_via_claude,
+            text,
+            [str(image_path)] if image_path else None,
+            msg.chat.id,
+            priority=budget.LOW,
+            _kind="classify",
+        )
+    except BudgetDenied as denied:
+        log.warning("classifier skipped by budget gate: %s", denied.decision.reason)
+        is_problem, classified_project, classified_repo, reason = (
+            True, None, None, "budget_" + denied.decision.level,
+        )
     if not is_problem:
         _cleanup_image(image_path)
         # If this CHAT-classified message is a reply *into* an ongoing
@@ -1070,6 +1085,7 @@ async def _run_chat_turn(
             session.session_id,
             text,
             image_strs or None,
+            priority=budget.CRITICAL, _kind="chat",
         )
         chat_sessions.record_turn(user_id, session_name, new_sid)
         out = response or "(bo'sh javob)"
@@ -1219,6 +1235,7 @@ async def on_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     analyze_with_instruction,
                     pending.message, pending.group_title, raw_text,
                     [str(p) for p in image_paths] if image_paths else None,
+                    priority=budget.CRITICAL, _kind="analyze_retry",
                 )
             except Exception as exc:  # noqa: BLE001
                 await msg.reply_text(f"Qayta urinish bajarilmadi: {exc}")
@@ -1248,7 +1265,11 @@ async def on_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if forced:
         intent, reason = forced, "forced_by_prefix"
     else:
-        intent, reason = await run_capped(classify_dm_intent, text, has_image)
+        # Developer is waiting on this DM; never sacrificed to budget.
+        intent, reason = await run_capped(
+            classify_dm_intent, text, has_image,
+            priority=budget.CRITICAL, _kind="classify_dm",
+        )
     log.info("dm intent=%s reason=%s", intent, reason)
 
     image_path = await _download_image(ctx, msg) if has_image else None
@@ -1294,6 +1315,7 @@ async def on_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 None,
                 text,
                 [str(p) for p in image_paths] if image_paths else None,
+                priority=budget.CRITICAL, _kind="chat",
             )
             await thinking.delete()
             await _send_chat_reply(msg, response or "(bo'sh javob)")
@@ -1344,7 +1366,10 @@ async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await update.effective_message.reply_text("Claude tekshirilmoqda...")
     try:
-        out = await run_capped(run_claude, "Reply with the single word: pong")
+        out = await run_capped(
+            run_claude, "Reply with the single word: pong",
+            priority=budget.CRITICAL, _kind="ping",
+        )
     except Exception as exc:  # noqa: BLE001
         await update.effective_message.reply_text(f"Claude xato: {exc}")
         return
@@ -1530,6 +1555,7 @@ async def cmd_retry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         new_diag = await run_capped(
             analyze_with_instruction,
             latest.message, latest.group_title, hint, None,
+            priority=budget.CRITICAL, _kind="analyze_retry",
         )
     except Exception as exc:  # noqa: BLE001
         await update.effective_message.reply_text(f"Qayta urinish bajarilmadi: {exc}")
@@ -1540,6 +1566,13 @@ async def cmd_retry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     latest.diagnosis = new_diag
     _persist_issue(latest)
     await _send_diagnosis_dm(ctx, latest.id)
+
+
+async def cmd_budget(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """`/budget` — what the agent team has spent, and on what."""
+    if not config.is_developer(update.effective_user.id):
+        return
+    await update.effective_message.reply_text(budget.format_report())
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2151,6 +2184,65 @@ async def _post_init_start_periodic_jobs(app: Application) -> None:
     `update_auto_apply` is true) pulls + restarts automatically.
     """
     asyncio.create_task(_auto_update_loop(app))
+    asyncio.create_task(_budget_watchdog_loop(app))
+
+
+async def _budget_watchdog_loop(app: Application) -> None:
+    """Watch spend; warn on threshold crossings, summarise once a day.
+
+    Edge-triggered, not level-triggered: it alerts when the level CHANGES
+    (ok → soft → hard), not on every pass. A watchdog that repeats the same
+    warning every ten minutes is one you learn to ignore, which defeats it.
+
+    The daily summary is unconditional — a quiet day is information too, and it
+    is the only way anyone notices "we spent nothing because the bot was down".
+    """
+    await asyncio.sleep(120)  # let startup settle
+
+    last_level = "ok"
+    last_report_day = None
+
+    while True:
+        try:
+            snap = budget.snapshot()
+            hour = float(snap["hour"].get("cost_usd") or 0)
+            day = float(snap["day"].get("cost_usd") or 0)
+            lim = snap["limits"]
+
+            if (lim["hour_hard"] > 0 and hour >= lim["hour_hard"]) or \
+               (lim["day_hard"] > 0 and day >= lim["day_hard"]):
+                level = "hard"
+            elif (lim["hour_soft"] > 0 and hour >= lim["hour_soft"]) or \
+                 (lim["day_soft"] > 0 and day >= lim["day_soft"]):
+                level = "soft"
+            else:
+                level = "ok"
+
+            if level != last_level:
+                if level == "hard":
+                    mode = ("Faqat shoshilinch ishlar bajariladi."
+                            if snap["enforcing"]
+                            else "Cheklash O'CHIQ — hech narsa to'xtatilmayapti.")
+                    await _dm_all_devs(app, "🔴 Sarf qattiq chegaradan oshdi.\n\n"
+                                            + budget.format_report() + "\n\n" + mode)
+                elif level == "soft":
+                    await _dm_all_devs(app, "🟡 Sarf yumshoq chegaradan oshdi.\n\n"
+                                            + budget.format_report())
+                else:
+                    await _dm_all_devs(app, "🟢 Sarf yana chegara ichida.")
+                last_level = level
+
+            today = datetime.now().date()
+            if last_report_day != today and datetime.now().hour >= 20:
+                await _dm_all_devs(app, "Kunlik hisobot\n\n" + budget.format_report())
+                last_report_day = today
+
+        except Exception:  # noqa: BLE001
+            # Never let the watchdog kill itself — a crashed monitor is worse
+            # than a noisy one, because nothing announces its absence.
+            log.exception("budget watchdog iteration failed")
+
+        await asyncio.sleep(600)
 
 
 async def _auto_update_loop(app: Application) -> None:
@@ -2279,6 +2371,7 @@ def build_app() -> Application:
         ("menu", cmd_menu),
         ("help", cmd_help),
         ("status", cmd_status),
+        ("budget", cmd_budget),
         ("projects", cmd_projects),
         ("version", cmd_version),
         ("update", cmd_update),
