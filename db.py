@@ -221,6 +221,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # restart — otherwise a bot restart mid-pipeline orphans the message and
     # the reporter is left looking at "ko'rib chiqyapman" forever.
     _add_column_if_missing(conn, "issues", "ack_message_id", "INTEGER")
+    # Analysis attempts. Persisted so a restart cannot reset the cap and
+    # hand a misbehaving issue a fresh budget to burn.
+    _add_column_if_missing(conn, "issues", "attempt_count", "INTEGER DEFAULT 0")
 
 
 def init() -> None:
@@ -906,3 +909,59 @@ def usage_by_kind(hours: int = 24) -> list[dict]:
             (f"-{int(hours)} hours",),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+# ============================================================================
+# Loop guards — takrorlanish va cheksiz navbatning oldini olish
+# ============================================================================
+
+def bump_attempt(issue_id: str) -> int:
+    """Increment and return the analysis attempt count for an issue.
+
+    Persisted rather than kept in memory: a restart must not hand a
+    misbehaving issue a fresh set of attempts. That is exactly how a bad
+    prompt turns into an unbounded spend loop.
+    """
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE issues SET attempt_count = COALESCE(attempt_count, 0) + 1 WHERE id = ?",
+            (issue_id,),
+        )
+        row = conn.execute(
+            "SELECT COALESCE(attempt_count, 0) AS n FROM issues WHERE id = ?", (issue_id,)
+        ).fetchone()
+        return int(row["n"]) if row else 1
+
+
+def recent_duplicate(chat_id: int, text: str, minutes: int = 10) -> bool:
+    """Has this exact message already been analysed here, very recently?
+
+    Guards the double-send: someone taps send twice, or forwards the same
+    complaint again while the first is still running. Without this each copy
+    starts its own analysis and pays for it.
+
+    Compares the first 500 chars, whitespace-collapsed — enough to catch a
+    genuine resend without treating two similar-but-different reports as one.
+    """
+    key = " ".join((text or "").split())[:500]
+    if not key:
+        return False
+    with _connect() as conn:
+        row = conn.execute(
+            """SELECT 1 FROM issues
+               WHERE group_id = ?
+                 AND created_at >= datetime('now', ?)
+                 AND substr(replace(replace(message, char(10), ' '), char(13), ' '), 1, 500) = ?
+               LIMIT 1""",
+            (chat_id, f"-{int(minutes)} minutes", key),
+        ).fetchone()
+        return row is not None
+
+
+def open_issue_count() -> int:
+    """How many issues are still open — the queue depth the bot is carrying."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM issues WHERE closed_at IS NULL"
+        ).fetchone()
+        return int(row["n"]) if row else 0

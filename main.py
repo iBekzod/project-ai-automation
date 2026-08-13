@@ -231,6 +231,16 @@ def _retry_only_keyboard(issue_id: str) -> InlineKeyboardMarkup:
 # Category → (group reply template, developer DM prefix, keyboard builder or None)
 # The group reply is what staff in the monitored chat see; the developer DM is
 # private and shows the full diagnosis.
+# Queue depth ceiling. The semaphore limits how many analyses run at once;
+# this limits how many can be WAITING. Without it a burst of reports is all
+# accepted and the last one gets answered an hour later, having spent the
+# budget on the way. Refusing early and saying so is the honest option.
+MAX_OPEN_ISSUES = 15
+
+# How many times one issue may be re-analysed. Retry is the only path a
+# human can fire repeatedly, and each pass is a full analysis.
+MAX_ANALYSIS_ATTEMPTS = 3
+
 CATEGORY_GROUP_REPLY = {
     "backend_bug":  "Tekshirilmoqda ({id}). Taxminan ~{eta} daqiqa.",
     "frontend_bug": "Bu frontend tomonida bo'lishi mumkin — frontend jamoaga o'tkazildi.",
@@ -602,6 +612,33 @@ async def on_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         classified_project, classified_repo, reason,
         group_title, has_image, text[:80] if text else "(no caption)",
     )
+
+    # ── Loop guards, before any money is spent ──────────────────────────────
+    #
+    # Both checks are cheap and both sit AFTER the classifier (so we only
+    # guard real problems) and BEFORE analysis (which is the expensive part).
+
+    # Double-send: someone taps send twice, or re-forwards the same complaint
+    # while the first analysis is still running. Each copy would otherwise
+    # start its own analysis and be paid for separately.
+    if db.recent_duplicate(msg.chat.id, text or ""):
+        log.info("group: duplicate of a recent report, skipping analysis")
+        await msg.reply_text("Bu xabar yaqinda kelgan edi — ustida ishlanyapti.")
+        _cleanup_image(image_path)
+        return
+
+    # Queue depth. The semaphore caps how many run AT ONCE but not how many
+    # pile up behind it, so 20 reports in a burst all get accepted and the
+    # last one is answered an hour later. Better to say so immediately.
+    open_count = db.open_issue_count()
+    if open_count >= MAX_OPEN_ISSUES:
+        log.warning("group: %d open issues, refusing new analysis", open_count)
+        await msg.reply_text(
+            "Hozir juda ko'p xabar ko'rilmoqda. Bu xabarni IT bo'limi qo'lda "
+            "ko'radi — yozganingiz yo'qolmaydi."
+        )
+        _cleanup_image(image_path)
+        return
 
     # This one message is the whole group-facing lifecycle: it is edited
     # through every later stage instead of new posts being added. See
@@ -1202,7 +1239,20 @@ def _pending_task_id(text: str) -> str:
 
 async def on_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
-    if not msg or not msg.from_user or not config.is_developer(msg.from_user.id):
+    if not msg or not msg.from_user:
+        return
+    if not config.is_developer(msg.from_user.id):
+        # Was silence. A staff member who writes here and gets nothing
+        # concludes the bot is broken and stops trying — so point them
+        # at the place that actually works.
+        try:
+            await msg.reply_text(
+                "Salom! Xatolik yoki muammo bo'lsa, IT guruhiga yozing — "
+                "u yerda avtomatik ko'rib chiqiladi. Bu yerga yozilgan "
+                "xabarlar qabul qilinmaydi."
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("could not reply to non-developer DM")
         return
     if msg.text and msg.text.startswith("/"):
         return  # commands handled separately
@@ -1235,6 +1285,15 @@ async def on_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(
             f"{pending.id} sizning izohingiz bilan qayta tahlil qilinmoqda..."
         )
+        # Attempt cap. Retry is the one path a human can trigger over and
+        # over, and each pass is a full analysis. Persisted in SQLite so a
+        # restart cannot hand the same issue a fresh set of attempts.
+        if db.bump_attempt(pending.id) > MAX_ANALYSIS_ATTEMPTS:
+            await msg.reply_text(
+                "Bu xabar {MAX_ANALYSIS_ATTEMPTS} marta qayta tahlil qilindi — avtomatik "
+                "urinish to'xtatildi. Qo'lda ko'rish kerak."
+            )
+            return
         try:
             try:
                 new_diag = await run_capped(
@@ -1557,6 +1616,15 @@ async def cmd_retry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         f"{latest.id} sizning izohingiz bilan qayta tahlil qilinmoqda..."
     )
+    # Attempt cap. Retry is the one path a human can trigger over and
+    # over, and each pass is a full analysis. Persisted in SQLite so a
+    # restart cannot hand the same issue a fresh set of attempts.
+    if db.bump_attempt(latest.id) > MAX_ANALYSIS_ATTEMPTS:
+        await update.effective_message.reply_text(
+        "Bu xabar {MAX_ANALYSIS_ATTEMPTS} marta qayta tahlil qilindi — avtomatik "
+        "urinish to'xtatildi. Qo'lda ko'rish kerak."
+        )
+        return
     try:
         new_diag = await run_capped(
             analyze_with_instruction,
