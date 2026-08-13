@@ -43,6 +43,7 @@ import github_ops
 import updater
 from bot_state import state as bot_state
 import budget
+import crm_bugs
 import team
 from claude_runner import (
     BudgetDenied,
@@ -475,13 +476,18 @@ async def _process_task(
             log.exception("analyze failed")
             # Plain language in the group; the exception text goes to the log,
             # not to the staff member who just reported a broken screen.
-            await set_stage(ctx.bot, source_chat_id, ack_message.message_id, "failed")
+            # ack_message is None for CRM-sourced reports — they have no
+            # group message to edit. The DM path still reports the failure.
+            if ack_message is not None:
+                await set_stage(ctx.bot, source_chat_id, ack_message.message_id, "failed")
             return
 
         if not diagnosis:
-            await ack_message.edit_text(
-                "Tahlil natija qaytarmadi — iltimos, aniqroq tushuntirib yoki screenshot qo'shib qayta yuboring."
-            )
+            if ack_message is not None:
+                await ack_message.edit_text(
+                    "Tahlil natija qaytarmadi — iltimos, aniqroq tushuntirib "
+                    "yoki screenshot qo'shib qayta yuboring."
+                )
             return
 
         issue_id = uuid.uuid4().hex[:8]
@@ -511,7 +517,8 @@ async def _process_task(
         else:
             template = CATEGORY_GROUP_REPLY.get(category, CATEGORY_GROUP_REPLY["unclear"])
             group_reply = template.format(id=issue_id, eta=eta, summary=summary)
-            await ack_message.edit_text(group_reply)
+            if ack_message is not None:
+                await ack_message.edit_text(group_reply)
 
         # Always DM the developer with full diagnosis + appropriate keyboard.
         try:
@@ -2266,6 +2273,54 @@ async def _post_init_start_periodic_jobs(app: Application) -> None:
     """
     asyncio.create_task(_auto_update_loop(app))
     asyncio.create_task(_budget_watchdog_loop(app))
+    asyncio.create_task(_crm_bug_poll_loop(app))
+
+
+async def _crm_bug_poll_loop(app: Application) -> None:
+    """Pull "tezkor xatolik" reports out of the CRM and analyse them.
+
+    Silent no-op until configured — the bot must run fine for anyone who has
+    no CRM, so a missing key is not an error.
+
+    Each report becomes an ordinary issue and goes through the normal
+    pipeline, so everything already built (budget gate, attempt cap, team
+    personas, diagnosis DM) applies without a second code path. The only
+    difference is where the text came from.
+    """
+    await asyncio.sleep(90)
+
+    while True:
+        try:
+            if crm_bugs.is_configured():
+                for report in crm_bugs.fetch_pending(limit=5):
+                    rid = report.get("id")
+                    if not rid:
+                        continue
+                    # Cursor first, then work. If analysis crashes we lose one
+                    # report; if we advanced last, a crash would replay it
+                    # forever — and each replay is a paid analysis.
+                    crm_bugs.advance_cursor(int(rid))
+                    crm_bugs.ack(int(rid), "in_progress")
+
+                    text = crm_bugs.as_complaint(report)
+                    await _dm_all_devs(
+                        app,
+                        team.say("product", f"CRM'dan yangi xatolik #{rid}:\n\n{text}"),
+                    )
+
+                    ack_msg = None  # CRM reports have no group message to edit
+                    asyncio.create_task(_process_task(
+                        app,
+                        text,
+                        source_chat_id=0,
+                        source_chat_title=f"CRM xatolik #{rid}",
+                        source_message_id=0,
+                        ack_message=ack_msg,
+                    ))
+        except Exception:  # noqa: BLE001
+            log.exception("crm bug poll iteration failed")
+
+        await asyncio.sleep(120)
 
 
 async def _budget_watchdog_loop(app: Application) -> None:
