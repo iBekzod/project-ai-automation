@@ -25,6 +25,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     Update,
 )
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -119,6 +120,11 @@ class Issue:
     message: str
     user_message_id: int
     diagnosis: dict
+    # The bot's status message in the group. Every later stage (approved,
+    # testing, released) edits THIS message rather than posting a new one, so
+    # one report never turns into five posts. None for DM-originated reports —
+    # set_issue_stage() no-ops then.
+    ack_message_id: int | None = None
     # Routing — set by Stage 1 classifier (None means "fall back to default
     # 'main' / 'backend' for backwards compat with single-project setups").
     project_id: str | None = None
@@ -229,6 +235,83 @@ CATEGORY_GROUP_REPLY = {
     "user_error":   "Bu dastur xatosi emas: {summary}",
     "unclear":      "Qo'shimcha ma'lumot kerak — iltimos, screenshot yuboring yoki qayerda xato sodir bo'lishini aniqroq yozing.",
 }
+
+# =============================================================================
+# Guruhdagi holat xabari — BITTA xabar, bosqichma-bosqich tahrirlanadi
+# =============================================================================
+#
+# The group gets exactly one message per report and that message is edited as
+# the pipeline advances. Message count stays 1; the content is always current.
+#
+# Why edit instead of posting updates: the group is where staff describe
+# problems. A stream of "PR ochildi" / "merge qilindi" posts buries the next
+# person's report and trains everyone to scroll past the channel. But silence
+# is just as bad — the pipeline runs for minutes and can sit waiting for a
+# human, and a reporter staring at "analysing..." for ten minutes assumes it
+# is stuck.
+#
+# Language is deliberately non-technical: no category keys, no file:line, no
+# branch names. The person who reported it wants to know what is broken and
+# when it will work. The technical detail belongs in the developer's DM card.
+#
+# A new MESSAGE is only justified when the bot needs something FROM the person
+# (a question). A status change never is.
+
+STAGE_TEXT = {
+    "received":  "Ko'rdim, ko'rib chiqyapman...",
+    "diagnosed": "Muammo topildi: {detail}\nTuzatish tayyorlanmoqda.",
+    "awaiting":  "Tuzatish tayyor, tasdiq kutilmoqda.",
+    "testing":   "Tasdiqlandi, sinovdan o'tkazilmoqda.",
+    "released":  "✅ Tuzatildi va ishga tushdi.",
+    "rejected":  "Bu safar tuzatilmadi. IT bo'limi qo'lda ko'rib chiqadi.",
+    "failed":    "⚠️ Avtomatik tahlil bajarilmadi. IT bo'limi qo'lda ko'radi.",
+}
+
+
+async def set_stage(bot, chat_id: int, message_id: int, stage: str, detail: str = "") -> bool:
+    """Edit a group status message to `stage`. Returns True when it changed.
+
+    Takes chat_id/message_id rather than a PTB Message so it still works after
+    a restart, when the Message object is gone but the ids survive in SQLite.
+
+    Telegram raises BadRequest("message is not modified") when the new text is
+    byte-identical to the old one. That is a normal outcome here — two stages
+    can produce the same line — so it is swallowed rather than logged as an
+    error. Every other failure is logged and reported back as False, because a
+    status message that silently stops updating is worse than no status at all.
+    """
+    template = STAGE_TEXT.get(stage)
+    if template is None:
+        log.warning("unknown stage %r", stage)
+        return False
+
+    body = template.format(detail=detail) if "{detail}" in template else template
+    text = f"{body}\n\nYangilandi: {datetime.now().strftime('%H:%M')}"
+
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+        return True
+    except BadRequest as exc:
+        if "not modified" in str(exc).lower():
+            return False
+        log.warning("stage %s edit failed (%s→%s): %s", stage, chat_id, message_id, exc)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        log.warning("stage %s edit failed (%s→%s): %s", stage, chat_id, message_id, exc)
+        return False
+
+
+async def set_issue_stage(bot, issue, stage: str, detail: str = "") -> bool:
+    """Advance the group status message belonging to `issue`.
+
+    No-op when the issue never had a group message (DM-originated reports), so
+    callers do not each have to guard for it.
+    """
+    chat_id = getattr(issue, "group_id", None)
+    message_id = getattr(issue, "ack_message_id", None)
+    if not chat_id or not message_id:
+        return False
+    return await set_stage(bot, chat_id, message_id, stage, detail)
 
 CATEGORY_LABEL = {
     "backend_bug":  "Backend (bu repo)",
@@ -373,7 +456,9 @@ async def _process_task(
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("analyze failed")
-            await ack_message.edit_text(f"Tahlil bajarilmadi: {exc}")
+            # Plain language in the group; the exception text goes to the log,
+            # not to the staff member who just reported a broken screen.
+            await set_stage(ctx.bot, source_chat_id, ack_message.message_id, "failed")
             return
 
         if not diagnosis:
@@ -392,6 +477,7 @@ async def _process_task(
             diagnosis=diagnosis,
             project_id=project_id,
             repo_role=repo_role,
+            ack_message_id=getattr(ack_message, "message_id", None),
         )
         ISSUES[issue_id] = new_issue
         _persist_issue(new_issue)
@@ -400,9 +486,15 @@ async def _process_task(
         summary = diagnosis.get("summary") or ""
         eta = diagnosis.get("eta_minutes") or "?"
 
-        template = CATEGORY_GROUP_REPLY.get(category, CATEGORY_GROUP_REPLY["unclear"])
-        group_reply = template.format(id=issue_id, eta=eta, summary=summary)
-        await ack_message.edit_text(group_reply)
+        # backend_bug is the only category that continues into the fix pipeline,
+        # so it is the only one that gets a "still moving" stage. Everything else
+        # is terminal for the group: say what it is, in plain language, once.
+        if category == "backend_bug":
+            await set_issue_stage(ctx.bot, new_issue, "diagnosed", summary or "aniqlanmoqda")
+        else:
+            template = CATEGORY_GROUP_REPLY.get(category, CATEGORY_GROUP_REPLY["unclear"])
+            group_reply = template.format(id=issue_id, eta=eta, summary=summary)
+            await ack_message.edit_text(group_reply)
 
         # Always DM the developer with full diagnosis + appropriate keyboard.
         try:
@@ -491,7 +583,10 @@ async def on_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         group_title, has_image, text[:80] if text else "(no caption)",
     )
 
-    ack = await msg.reply_text("AI tahlil qilmoqda...")
+    # This one message is the whole group-facing lifecycle: it is edited
+    # through every later stage instead of new posts being added. See
+    # STAGE_TEXT / set_stage().
+    ack = await msg.reply_text(STAGE_TEXT["received"])
     ongoing = OngoingAck(
         chat_id=msg.chat.id,
         ack_message_id=ack.message_id,
@@ -763,6 +858,11 @@ async def _apply_issue(ctx: ContextTypes.DEFAULT_TYPE, issue: Issue) -> None:
         issue.merged_to_stage = merged
         _persist_issue(issue)
 
+        # Group sees plain language, no branch names or PR links: merged means
+        # it is on its way to being tested, not-merged means a human has to
+        # look before anything moves.
+        await set_issue_stage(ctx.bot, issue, "testing" if merged else "awaiting")
+
         status = "stage'ga birlashtirildi" if merged else "PR ochildi (avto-merge bajarilmadi)"
         await _dm_all_devs(
             ctx,
@@ -784,14 +884,22 @@ async def _publish_issue(ctx: ContextTypes.DEFAULT_TYPE, issue: Issue) -> None:
         return
 
     if ok:
-        try:
-            await ctx.bot.send_message(
-                issue.group_id,
-                "Tuzatildi. Xabaringiz uchun rahmat!",
-                reply_to_message_id=issue.user_message_id,
-            )
-        except Exception:  # noqa: BLE001
-            log.exception("could not notify group %s", issue.group_id)
+        # Was a NEW message in the group; now it edits the one status message
+        # the report already owns. Same information, one post instead of two,
+        # and it stays attached to the original complaint.
+        edited = await set_issue_stage(ctx.bot, issue, "released")
+        if not edited:
+            # No status message to edit (DM-originated, or the edit failed).
+            # Falling back to a post is right here: "it is fixed" is the one
+            # thing the reporter must not miss.
+            try:
+                await ctx.bot.send_message(
+                    issue.group_id,
+                    "✅ Tuzatildi va ishga tushdi. Xabaringiz uchun rahmat!",
+                    reply_to_message_id=issue.user_message_id,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("could not notify group %s", issue.group_id)
         await _dm_all_devs(
             ctx,
             f"{issue.id} {config.PROD_BRANCH} shoxobchasiga chiqarildi.",
@@ -2155,28 +2263,40 @@ def build_app() -> Application:
         .post_init(_post_init_start_periodic_jobs)
         .build()
     )
-    app.add_handler(CommandHandler("start",    cmd_start))
-    app.add_handler(CommandHandler("ping",     cmd_ping))
-    app.add_handler(CommandHandler("whereami", cmd_whereami))
-    app.add_handler(CommandHandler("menu",     cmd_menu))
-    app.add_handler(CommandHandler("help",     cmd_help))
-    app.add_handler(CommandHandler("status",   cmd_status))
-    app.add_handler(CommandHandler("projects", cmd_projects))
-    app.add_handler(CommandHandler("version",    cmd_version))
-    app.add_handler(CommandHandler("update",     cmd_update))
-    app.add_handler(CommandHandler("autoupdate", cmd_autoupdate))
-    app.add_handler(CommandHandler("chat",     cmd_chat))
-    app.add_handler(CommandHandler("chatlist", cmd_chatlist))
-    app.add_handler(CommandHandler("stop",     cmd_stop))
-    app.add_handler(CommandHandler("stopall",  cmd_stopall))
-    app.add_handler(CommandHandler("ask",      cmd_ask))
-    app.add_handler(CommandHandler("task",     cmd_task))
-    app.add_handler(CommandHandler("retry",    cmd_retry))
-    app.add_handler(CommandHandler("accept",   cmd_accept))
-    app.add_handler(CommandHandler("skip",     cmd_skip))
-    app.add_handler(CommandHandler("publish",  cmd_publish))
-    app.add_handler(CommandHandler("push",     cmd_push))
-    app.add_handler(CommandHandler("rollback", cmd_rollback))
+    # Commands are PRIVATE-ONLY.
+    #
+    # The monitored group is a place where staff report problems — nothing
+    # else. A bot that answers /menu, /status or /chatlist in there turns a
+    # complaints channel into a console, and every reply is noise for the
+    # people trying to describe a bug. The whole interactive surface
+    # (menus, diagnosis cards, approve/skip/publish) belongs in the DM with
+    # the developers, which is where the cards are sent anyway.
+    private = filters.ChatType.PRIVATE
+    for name, handler in (
+        ("start", cmd_start),
+        ("ping", cmd_ping),
+        ("whereami", cmd_whereami),
+        ("menu", cmd_menu),
+        ("help", cmd_help),
+        ("status", cmd_status),
+        ("projects", cmd_projects),
+        ("version", cmd_version),
+        ("update", cmd_update),
+        ("autoupdate", cmd_autoupdate),
+        ("chat", cmd_chat),
+        ("chatlist", cmd_chatlist),
+        ("stop", cmd_stop),
+        ("stopall", cmd_stopall),
+        ("ask", cmd_ask),
+        ("task", cmd_task),
+        ("retry", cmd_retry),
+        ("accept", cmd_accept),
+        ("skip", cmd_skip),
+        ("publish", cmd_publish),
+        ("push", cmd_push),
+        ("rollback", cmd_rollback),
+    ):
+        app.add_handler(CommandHandler(name, handler, filters=private))
     app.add_handler(CallbackQueryHandler(on_button))
     # Accept text, photo, or image-type documents. Non-image files are ignored.
     media_filter = filters.TEXT | filters.PHOTO | filters.Document.IMAGE
@@ -2185,7 +2305,13 @@ def build_app() -> Application:
     app.add_handler(
         MessageHandler(filters.ChatType.PRIVATE & _menu_button_filter(), on_menu_button),
     )
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS  & media_filter, on_group_message))
+    # `~filters.COMMAND` matters: with commands now private-only, a "/menu"
+    # typed in the group would otherwise fall through to this handler as plain
+    # TEXT and get sent to the classifier — burning a Claude call on the word
+    # "/menu". Commands in the group are ignored outright.
+    app.add_handler(
+        MessageHandler(filters.ChatType.GROUPS & media_filter & ~filters.COMMAND, on_group_message),
+    )
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & media_filter, on_dm))
     return app
 

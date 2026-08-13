@@ -185,6 +185,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     """Forward-only column additions for existing DBs."""
     _add_column_if_missing(conn, "issues", "project_id", "TEXT")
     _add_column_if_missing(conn, "issues", "repo_role",  "TEXT")
+    # The group status message this report owns. Every pipeline stage edits
+    # THIS message instead of posting a new one, so the id has to survive a
+    # restart — otherwise a bot restart mid-pipeline orphans the message and
+    # the reporter is left looking at "ko'rib chiqyapman" forever.
+    _add_column_if_missing(conn, "issues", "ack_message_id", "INTEGER")
 
 
 def init() -> None:
@@ -288,8 +293,9 @@ def save_issue(issue: dict) -> None:
             """INSERT INTO issues(
                 id, project, project_id, repo_role, group_id, group_title,
                 user_message_id, message, diagnosis_json, category, branch,
-                pr_url, merged_to_stage, awaiting_retry, retry_initiator
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                pr_url, merged_to_stage, awaiting_retry, retry_initiator,
+                ack_message_id
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 project=excluded.project,
                 project_id=excluded.project_id,
@@ -302,7 +308,8 @@ def save_issue(issue: dict) -> None:
                 pr_url=excluded.pr_url,
                 merged_to_stage=excluded.merged_to_stage,
                 awaiting_retry=excluded.awaiting_retry,
-                retry_initiator=excluded.retry_initiator
+                retry_initiator=excluded.retry_initiator,
+                ack_message_id=excluded.ack_message_id
             """,
             (
                 issue["id"],
@@ -320,6 +327,7 @@ def save_issue(issue: dict) -> None:
                 int(bool(issue.get("merged_to_stage"))),
                 int(bool(issue.get("awaiting_retry_prompt"))),
                 issue.get("retry_initiator"),
+                issue.get("ack_message_id"),
             ),
         )
 
@@ -360,6 +368,9 @@ def _row_to_issue(row: sqlite3.Row) -> dict:
         "merged_to_stage":       bool(row["merged_to_stage"]),
         "awaiting_retry_prompt": bool(row["awaiting_retry"]),
         "retry_initiator":       row["retry_initiator"],
+        # Guarded like project_id/repo_role: a DB written before this column
+        # existed has no such key, and row["..."] would raise on it.
+        "ack_message_id":        row["ack_message_id"] if "ack_message_id" in keys else None,
         "created_at":            row["created_at"],
     }
 
