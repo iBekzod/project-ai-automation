@@ -14,6 +14,16 @@ server-side "unread" flag would be wrong the moment we crash between fetching
 and processing. Owning the cursor means a restart never double-processes and
 never skips.
 
+WHY SEVERAL SOURCES
+`crm_api_url` holds a LIST. Stage and prod run the same repository, so a bug
+reported on either is the same bug and gets the same fix — pointing the bot at
+one of them only decided which reports it never saw. It watches both, with a
+SEPARATE cursor per environment: ids restart from 1 in each, so a shared cursor
+would silently swallow everything below the other environment's high-water mark.
+
+Every report carries the label of the environment it came from, because "#1"
+alone is ambiguous once two servers are in play.
+
 AUTH
 X-API-Key / X-API-Secret — a machine credential, not a person's login. See
 the CRM's BugReportAgentApiKey for why.
@@ -23,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import db
@@ -37,13 +48,41 @@ def _cfg(key: str, default: str = "") -> str:
     return (db.get_setting(key) or default).strip()
 
 
+def _sources() -> list[tuple[str, str]]:
+    """(label, base_url) per configured environment.
+
+    `crm_api_url` accepts several URLs separated by comma, semicolon or
+    newline. One URL still works — it is just a list of one.
+
+    The label comes from the host so it survives the URL changing, and it is
+    what the cursor is keyed on; renaming it would replay that environment's
+    backlog, so it is derived, never typed.
+    """
+    raw = _cfg("crm_api_url")
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for part in raw.replace(";", ",").replace("\n", ",").split(","):
+        url = part.strip().rstrip("/")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        host = (urllib.parse.urlparse(url).hostname or url).lower()
+        label = "stage" if "stage" in host else ("dev" if "dev" in host else "prod")
+        # Two URLs that map to the same label would fight over one cursor.
+        base_label, n = label, 2
+        while any(lbl == label for lbl, _ in out):
+            label = f"{base_label}{n}"
+            n += 1
+        out.append((label, url))
+    return out
+
+
 def is_configured() -> bool:
-    return bool(_cfg("crm_api_url") and _cfg("crm_agent_key") and _cfg("crm_agent_secret"))
+    return bool(_sources() and _cfg("crm_agent_key") and _cfg("crm_agent_secret"))
 
 
-def _post(path: str, payload: dict) -> dict | None:
-    """POST to the CRM agent API. Returns None on any failure (logged)."""
-    base = _cfg("crm_api_url").rstrip("/")
+def _post(base: str, path: str, payload: dict) -> dict | None:
+    """POST to one CRM agent API. Returns None on any failure (logged)."""
     req = urllib.request.Request(
         base + path,
         data=json.dumps(payload).encode("utf-8"),
@@ -73,40 +112,70 @@ def _post(path: str, payload: dict) -> dict | None:
         return None
 
 
-def fetch_pending(limit: int = 10) -> list[dict]:
-    """New reports since our cursor. Cursor is NOT advanced here.
+def _cursor_key(label: str) -> str:
+    return f"{CURSOR_KEY}:{label}"
 
-    Advancing on fetch would lose a report if we crash between fetching and
-    processing it. The caller advances per item, after the work is safely
-    handed off.
+
+def _read_cursor(label: str) -> int:
+    raw = db.get_setting(_cursor_key(label))
+    if raw is None:
+        # First run after this became multi-source: inherit the single old
+        # cursor rather than starting at 0, which would replay every report
+        # that environment has ever filed — each replay being a paid analysis.
+        raw = db.get_setting(CURSOR_KEY)
+    return int(raw) if raw and str(raw).isdigit() else 0
+
+
+def fetch_pending(limit: int = 10) -> list[dict]:
+    """New reports since our cursor, across every configured environment.
+
+    The cursor is NOT advanced here: advancing on fetch would lose a report if
+    we crash between fetching and processing it. The caller advances per item,
+    after the work is safely handed off.
+
+    Each returned report gains `_source` (label) and `_base` (url) so the ack
+    goes back to the server it came from — acking prod for a stage report would
+    hit an unrelated row with the same id.
     """
     if not is_configured():
         return []
-    after = 0
-    raw = db.get_setting(CURSOR_KEY)
-    if raw and str(raw).isdigit():
-        after = int(raw)
 
-    data = _post("/agent/bug-report/pending", {"after_id": after, "limit": limit})
-    if not data:
-        return []
-    return data.get("data") or []
-
-
-def advance_cursor(report_id: int) -> None:
-    """Move the cursor forward — never backward, so a late reply cannot rewind it."""
-    raw = db.get_setting(CURSOR_KEY)
-    current = int(raw) if raw and str(raw).isdigit() else 0
-    if report_id > current:
-        db.set_setting(CURSOR_KEY, str(report_id))
+    out: list[dict] = []
+    for label, base in _sources():
+        data = _post(base, "/agent/bug-report/pending", {
+            "after_id": _read_cursor(label),
+            "limit": limit,
+        })
+        for report in (data or {}).get("data") or []:
+            report["_source"] = label
+            report["_base"] = base
+            out.append(report)
+    return out
 
 
-def ack(report_id: int, status: str = "in_progress", note: str = "") -> bool:
-    """Tell the CRM we picked this up (or are rejecting it)."""
-    payload = {"id": int(report_id), "status": status}
+def advance_cursor(report: dict) -> None:
+    """Move one environment's cursor forward — never backward, so a late reply
+    cannot rewind it."""
+    label = report.get("_source") or "prod"
+    rid = int(report.get("id") or 0)
+    if rid > _read_cursor(label):
+        db.set_setting(_cursor_key(label), str(rid))
+
+
+def ack(report: dict, status: str = "in_progress", note: str = "") -> bool:
+    """Tell the CRM the report came from that we picked this up."""
+    base = report.get("_base")
+    if not base:
+        return False
+    payload = {"id": int(report.get("id") or 0), "status": status}
     if note:
         payload["note"] = note[:2000]
-    return _post("/agent/bug-report/ack", payload) is not None
+    return _post(base, "/agent/bug-report/ack", payload) is not None
+
+
+def label_of(report: dict) -> str:
+    """Environment label for display — "#1" alone is ambiguous across servers."""
+    return report.get("_source") or "prod"
 
 
 def as_complaint(report: dict) -> str:

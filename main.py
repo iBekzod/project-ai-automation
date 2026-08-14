@@ -2299,13 +2299,16 @@ async def _crm_bug_poll_loop(app: Application) -> None:
                     # Cursor first, then work. If analysis crashes we lose one
                     # report; if we advanced last, a crash would replay it
                     # forever — and each replay is a paid analysis.
-                    crm_bugs.advance_cursor(int(rid))
-                    crm_bugs.ack(int(rid), "in_progress")
+                    crm_bugs.advance_cursor(report)
+                    crm_bugs.ack(report, "in_progress")
 
+                    # Stage and prod both number from 1, so the environment has
+                    # to be on screen or two different bugs read as one.
+                    where = crm_bugs.label_of(report)
                     text = crm_bugs.as_complaint(report)
                     await _dm_all_devs(
                         app,
-                        team.say("product", f"CRM'dan yangi xatolik #{rid}:\n\n{text}"),
+                        team.say("product", f"CRM'dan yangi xatolik #{rid} ({where}):\n\n{text}"),
                     )
 
                     ack_msg = None  # CRM reports have no group message to edit
@@ -2313,7 +2316,7 @@ async def _crm_bug_poll_loop(app: Application) -> None:
                         app,
                         text,
                         source_chat_id=0,
-                        source_chat_title=f"CRM xatolik #{rid}",
+                        source_chat_title=f"CRM xatolik #{rid} ({where})",
                         source_message_id=0,
                         ack_message=ack_msg,
                     ))
