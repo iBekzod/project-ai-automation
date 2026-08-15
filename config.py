@@ -141,6 +141,11 @@ CLAUDE_TIMEOUT: int = _int("CLAUDE_TIMEOUT", 900)
 # reaches a server without a person saying so.
 AGENT_FULL_ACCESS: bool = _bool("AGENT_FULL_ACCESS", True)
 
+# Model for the routing classifiers (group triage stage 1, DM intent).
+# Empty leaves the CLI default. See _classifier_model_args() for the numbers
+# that motivated this.
+CLASSIFIER_MODEL: str = os.getenv("CLASSIFIER_MODEL", "haiku")
+
 CLAUDE_ADD_DIRS: list = [
     p.strip() for p in os.getenv("CLAUDE_ADD_DIRS", r"D:\projects\xonsaroy\xonsaroy-agent-memory").split(",")
     if p.strip()
@@ -157,6 +162,7 @@ _DB_BACKED_KEYS = {
     "CLAUDE_TIMEOUT",
     "CLAUDE_ADD_DIRS",
     "AGENT_FULL_ACCESS",
+    "CLASSIFIER_MODEL",
     "MAX_PARALLEL_CLAUDE",
     "STAGE_BRANCH",
     "PROD_BRANCH",
@@ -222,6 +228,7 @@ def reload() -> None:
     g["CLAUDE_ADD_DIRS"]        = [x.strip() for x in raw_dirs.split(",") if x.strip()]
     raw_full = pick("AGENT_FULL_ACCESS", "true").strip().lower()
     g["AGENT_FULL_ACCESS"]      = raw_full in ("1", "true", "yes", "on")
+    g["CLASSIFIER_MODEL"]       = pick("CLASSIFIER_MODEL", "haiku")
 
 
 def summarize() -> str:

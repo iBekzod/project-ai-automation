@@ -47,6 +47,22 @@ class BudgetDenied(RuntimeError):
         self.decision = decision
 
 
+def _classifier_model_args() -> list[str]:
+    """Run routing decisions on the small model.
+
+    Measured on this bot's own ledger: the two classifiers spent about 30k
+    cache-creation tokens per call to pick one of five labels, on the same
+    model that does the actual engineering. The decision is short, the input is
+    one message, and being slightly less clever costs nothing here — a
+    borderline call already defaults to "treat it as a problem", so the
+    expensive path is still reachable.
+
+    Configurable because model names change; empty means "leave the default".
+    """
+    m = (getattr(config, "CLASSIFIER_MODEL", "") or "").strip()
+    return ["--model", m] if m else []
+
+
 def _add_dir_args() -> list[str]:
     """`--add-dir` for every configured extra root that exists.
 
@@ -542,7 +558,7 @@ def classify_via_claude(
     _t0 = time.monotonic()
     try:
         result = subprocess.run(
-            [cli, "--print", "--output-format", "json", *_add_dir_args()],
+            [cli, "--print", "--output-format", "json", *_classifier_model_args()],
             input=prompt,
             capture_output=True,
             text=True,
@@ -680,7 +696,7 @@ def classify_dm_intent(
     _t0 = time.monotonic()
     try:
         result = subprocess.run(
-            [cli, "--print", "--output-format", "json", *_add_dir_args()],
+            [cli, "--print", "--output-format", "json", *_classifier_model_args()],
             input=prompt,
             capture_output=True,
             text=True,
@@ -743,6 +759,11 @@ Act like the assistant he talks to in his terminal: do the work, do not describe
 
 Reply in the language he writes in (Uzbek Latin when he writes Uzbek). Telegram, not a terminal: no ANSI, keep formatting light, and put the answer first — he often reads it on a phone.
 
+CREDENTIALS
+They live in `D:/projects/xonsaroy/.agent-secrets.env` — beside the repos, inside none of them, so no commit can carry them out. Read it when you need a key instead of asking for one again; the file also documents what each credential opens.
+
+Never print a value in a reply, a log or a commit message, never copy one into the memory repo, and never put one on a command line where `ps` would show it — use an environment variable or stdin.
+
 WHAT YOU CAN REACH
 - D:\\projects\\xonsaroy — every repo: xonsaroy-latest (CRM backend), frontend, kubernetes, project-ai-automation, xonsaroy-agent-memory
 - The cluster through `ssh xonsaroy-master kubectl ...`, GitHub through `gh`
@@ -751,7 +772,16 @@ WHAT YOU CAN REACH
 MEMORY — READ IT, THEN ADD TO IT
 xonsaroy-agent-memory is the shared notebook, linked to Obsidian. Before non-trivial work, read what is already known there (CRM/dev/ for architecture and traps, General/dev/ for environments and people). After work that taught you something durable — a trap, a fact that contradicts the docs, a decision and its reason — append it in the same style. Skip what the code or git history already says; write what a person could not derive by reading the repo.
 
-This is how you get stronger over time. A session that solves a problem and records nothing has to solve it again.
+GETTING STRONGER
+Two places, and they are not the same thing.
+
+A TRAP or a fact goes in memory: something that failed silently, a column that is empty where you expected data, a document that contradicts the code. Short, with how you verified it. Read `xonsaroy-agent-memory/AGENTS.md` first — files under `*/dev/**` are shared with a person, so write there as a proposal and say you did; `_agent/**` is yours. Never write credentials, IP addresses, phone numbers, client names or exact money figures.
+
+A PROCEDURE goes in a skill: `<repo>/.claude/skills/<name>.md` with `name` and `description` frontmatter. When you have worked out a sequence you would otherwise re-derive — how to deploy and confirm it landed, how to run a script inside a pod, how to reach a database — write it down as a skill. Skills load only when their description matches the task, so they cost nothing until needed. `stage-deploy` and `run-in-pod` already exist; extend them rather than writing a second copy.
+
+The test for both: would a competent person still get this wrong after reading the repo? If yes, write it. If the code or git history already says it, do not.
+
+A session that solves a problem and records nothing has to solve it again.
 
 SAFETY
 {deploy_rule}
