@@ -107,6 +107,45 @@ CLAUDE_CLI: str = os.getenv("CLAUDE_CLI", "claude")
 # too tight and caused empty investigations.
 CLAUDE_TIMEOUT: int = _int("CLAUDE_TIMEOUT", 900)
 
+# Extra directories Claude may read and write, beyond REPO_PATH.
+#
+# WHY THIS EXISTS
+# Claude is started with cwd=REPO_PATH and refuses anything outside it.
+# The agent memory lives in a SEPARATE repo next door, so every attempt to
+# read it was denied by the permission prompt and the bot reported it could
+# not confirm the folder even existed — exactly what happened when it was
+# asked to use the Obsidian-linked notes.
+#
+# Comma-separated absolute paths. Empty means "repo only", the old
+# behaviour.
+#
+# This widens what an autonomous agent can touch, so it is a LIST and not a
+# switch: naming the folders keeps the blast radius to what the work needs.
+# The gate that makes it acceptable is TELEGRAM_DEVELOPER_IDS — only those
+# accounts can command the bot; everyone else gets a redirect.
+# Personal-agent mode: run Claude with no permission prompts.
+#
+# WHY IT IS NEEDED
+# Claude runs here non-interactively (`--print`). There is no terminal
+# to answer a permission prompt, so anything needing approval simply
+# fails — which is why the assistant could describe work but never do
+# it. Bypassing prompts is what makes it able to act at all.
+#
+# WHY IT IS ACCEPTABLE HERE, AND ONLY HERE
+# This mode is reachable only from a DM by an id in
+# TELEGRAM_DEVELOPER_IDS — everyone else gets a redirect and never
+# reaches Claude. It is the owner's own machine, driven by the owner.
+# The group triage path does NOT use it.
+#
+# What it does NOT do: DRY_RUN still blocks `git push`, so nothing
+# reaches a server without a person saying so.
+AGENT_FULL_ACCESS: bool = _bool("AGENT_FULL_ACCESS", True)
+
+CLAUDE_ADD_DIRS: list = [
+    p.strip() for p in os.getenv("CLAUDE_ADD_DIRS", r"D:\projects\xonsaroy\xonsaroy-agent-memory").split(",")
+    if p.strip()
+]
+
 
 # Mutable settings keys that live in the SQLite `settings` table when
 # present. .env values seed these on first run; runtime edits via the GUI
@@ -116,6 +155,8 @@ _DB_BACKED_KEYS = {
     "DRY_RUN",
     "CLAUDE_CLI",
     "CLAUDE_TIMEOUT",
+    "CLAUDE_ADD_DIRS",
+    "AGENT_FULL_ACCESS",
     "MAX_PARALLEL_CLAUDE",
     "STAGE_BRANCH",
     "PROD_BRANCH",
@@ -177,6 +218,10 @@ def reload() -> None:
     g["CLAUDE_CLI"]             = pick("CLAUDE_CLI", "claude")
     raw_to = pick("CLAUDE_TIMEOUT", "900").strip()
     g["CLAUDE_TIMEOUT"]         = int(raw_to) if raw_to.isdigit() else 900
+    raw_dirs = pick("CLAUDE_ADD_DIRS", r"D:\projects\xonsaroy\xonsaroy-agent-memory")
+    g["CLAUDE_ADD_DIRS"]        = [x.strip() for x in raw_dirs.split(",") if x.strip()]
+    raw_full = pick("AGENT_FULL_ACCESS", "true").strip().lower()
+    g["AGENT_FULL_ACCESS"]      = raw_full in ("1", "true", "yes", "on")
 
 
 def summarize() -> str:
@@ -187,5 +232,6 @@ def summarize() -> str:
         f"DEVELOPER_IDS={TELEGRAM_DEVELOPER_IDS}\n"
         f"MONITORED_GROUP_IDS={MONITORED_GROUP_IDS}\n"
         f"TRIGGER_KEYWORDS={TRIGGER_KEYWORDS or '(all messages)'}\n"
-        f"DRY_RUN={DRY_RUN}  CLAUDE_CLI={CLAUDE_CLI}  CLAUDE_TIMEOUT={CLAUDE_TIMEOUT}"
+        f"DRY_RUN={DRY_RUN}  CLAUDE_CLI={CLAUDE_CLI}  CLAUDE_TIMEOUT={CLAUDE_TIMEOUT}\n"
+        f"CLAUDE_ADD_DIRS={CLAUDE_ADD_DIRS or '(repo only)'}"
     )

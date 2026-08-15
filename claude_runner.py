@@ -47,6 +47,27 @@ class BudgetDenied(RuntimeError):
         self.decision = decision
 
 
+def _add_dir_args() -> list[str]:
+    """`--add-dir` for every configured extra root that exists.
+
+    Claude only reaches outside its working directory when told to, which is
+    why the agent memory — a separate repo beside the CRM one — came back as
+    "permission denied, cannot confirm it exists".
+
+    Missing paths are skipped rather than passed through: the CLI rejects a
+    non-existent --add-dir and the whole run would fail, turning a stale
+    setting into a dead bot.
+    """
+    import os
+    out: list[str] = []
+    for d in (getattr(config, "CLAUDE_ADD_DIRS", None) or []):
+        if os.path.isdir(d):
+            out.extend(["--add-dir", d])
+        else:
+            log.warning("CLAUDE_ADD_DIRS: skipping missing path %s", d)
+    return out
+
+
 async def run_capped(fn, *args, priority: str = budget.NORMAL, _kind: str = "", **kwargs):
     """Dispatch a Claude call: budget gate first, then the concurrency cap.
 
@@ -284,7 +305,7 @@ def run_claude(
 
     try:
         result = subprocess.run(
-            [cli, "--print", "--output-format", "json"],
+            [cli, "--print", "--output-format", "json", *_add_dir_args()],
             input=prompt,
             capture_output=True,
             text=True,
@@ -521,7 +542,7 @@ def classify_via_claude(
     _t0 = time.monotonic()
     try:
         result = subprocess.run(
-            [cli, "--print", "--output-format", "json"],
+            [cli, "--print", "--output-format", "json", *_add_dir_args()],
             input=prompt,
             capture_output=True,
             text=True,
@@ -659,7 +680,7 @@ def classify_dm_intent(
     _t0 = time.monotonic()
     try:
         result = subprocess.run(
-            [cli, "--print", "--output-format", "json"],
+            [cli, "--print", "--output-format", "json", *_add_dir_args()],
             input=prompt,
             capture_output=True,
             text=True,
@@ -712,6 +733,113 @@ def classify_dm_intent(
 
 
 # =============================================================================
+# Personal agent mode — the owner's assistant, not a code reviewer.
+# =============================================================================
+
+AGENT_PROMPT_HEADER = """You are Bekzod's personal engineering assistant at Xonsaroy, reached over Telegram.
+
+HOW TO BEHAVE
+Act like the assistant he talks to in his terminal: do the work, do not describe it and wait. You have the full tool set and the whole machine. When something is ambiguous, make the reasonable call and say which call you made — ask only when getting it wrong would be costly or irreversible.
+
+Reply in the language he writes in (Uzbek Latin when he writes Uzbek). Telegram, not a terminal: no ANSI, keep formatting light, and put the answer first — he often reads it on a phone.
+
+WHAT YOU CAN REACH
+- D:\\projects\\xonsaroy — every repo: xonsaroy-latest (CRM backend), frontend, kubernetes, project-ai-automation, xonsaroy-agent-memory
+- The cluster through `ssh xonsaroy-master kubectl ...`, GitHub through `gh`
+- Databases through the DBeaver tunnel host (95.217.156.3)
+
+MEMORY — READ IT, THEN ADD TO IT
+xonsaroy-agent-memory is the shared notebook, linked to Obsidian. Before non-trivial work, read what is already known there (CRM/dev/ for architecture and traps, General/dev/ for environments and people). After work that taught you something durable — a trap, a fact that contradicts the docs, a decision and its reason — append it in the same style. Skip what the code or git history already says; write what a person could not derive by reading the repo.
+
+This is how you get stronger over time. A session that solves a problem and records nothing has to solve it again.
+
+SAFETY
+`git push` is blocked while DRY_RUN is on: prepare the change, commit locally, and say it is ready. Before anything hard to reverse — dropping data, restarting production, sending to clients — say what you are about to do and wait for his answer.
+
+His message:
+"""
+
+
+def agent_chat(
+    session_id: str | None,
+    message: str,
+    image_paths: list[str] | None = None,
+    timeout: int | None = None,
+) -> tuple[str, str | None]:
+    """A real working session, unlike chat_with_claude which is read-only.
+
+    The read-only mode exists so a developer can ask about the codebase without
+    risk. This one is the opposite: it is the owner's assistant and it is
+    expected to change files, run commands and finish tasks. The gate is who
+    may reach it — developer DMs only — not what it is allowed to touch.
+
+    Same session plumbing: the id comes back on the first turn and is reused
+    with --resume, so the conversation keeps its context across messages.
+    """
+    text = (message or "").strip()
+    if not text and not image_paths:
+        return ("(bo'sh xabar)", session_id)
+
+    image_note = ""
+    if image_paths:
+        lines = "\n".join(f"- {p}" for p in image_paths)
+        image_note = (
+            "\n\nAttached image(s) — Read each one:\n" + lines + "\n"
+        )
+
+    full_prompt = AGENT_PROMPT_HEADER + text + image_note
+
+    cli = _resolve_cli(config.CLAUDE_CLI)
+    args = [cli, "--print", "--output-format", "json", *_add_dir_args()]
+
+    # No --disallowedTools here, and prompts bypassed: with --print there is no
+    # terminal to approve anything, so without this the assistant can plan work
+    # but never carry it out.
+    if getattr(config, "AGENT_FULL_ACCESS", True):
+        args.extend(["--permission-mode", "bypassPermissions"])
+
+    if session_id:
+        args.extend(["--resume", session_id])
+
+    effective_timeout = timeout or config.CLAUDE_TIMEOUT
+    log.info(
+        "agent invoking claude (session_id=%s, prompt=%d chars, full_access=%s)",
+        session_id or "new", len(full_prompt),
+        getattr(config, "AGENT_FULL_ACCESS", True),
+    )
+
+    try:
+        result = subprocess.run(
+            args,
+            input=full_prompt,
+            capture_output=True,
+            text=True,
+            cwd=str(config.REPO_PATH),
+            timeout=effective_timeout,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        return (f"Vaqt tugadi ({effective_timeout}s). Vazifani kichikroq bo'laklarga bo'ling.", session_id)
+    except FileNotFoundError:
+        return ("Claude CLI topilmadi — Sozlamalarda CLAUDE_CLI yo'lini ko'rsating.", session_id)
+
+    if result.returncode != 0:
+        log.error("agent claude failed rc=%s stderr=%s", result.returncode, (result.stderr or "")[:400])
+        return (f"Claude xato qaytardi (rc={result.returncode}).", session_id)
+
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return ((result.stdout or "").strip()[:3500] or "(bo'sh javob)", session_id)
+
+    reply = (payload.get("result") or "").strip()
+    new_sid = payload.get("session_id")
+    db.record_usage("agent", payload, ok=True)
+
+    return (reply or "(bo'sh javob)", new_sid if not session_id else None)
+
+# =============================================================================
 # Chat mode — multi-turn Claude Code conversation per session.
 # =============================================================================
 
@@ -758,7 +886,7 @@ def chat_with_claude(
     full_prompt = CHAT_PROMPT_HEADER + text + image_note
 
     cli = _resolve_cli(config.CLAUDE_CLI)
-    args = [cli, "--print", "--output-format", "json"]
+    args = [cli, "--print", "--output-format", "json", *_add_dir_args()]
     # Hard tool-gate: chat mode is read-only. Claude can Read / Grep / Glob /
     # run read-only Bash, but cannot mutate files. Any edit requested in chat
     # gets described, not applied — the dev promotes it to /task or `!` for

@@ -48,6 +48,7 @@ import team
 from claude_runner import (
     BudgetDenied,
     analyze,
+    agent_chat,
     analyze_with_instruction,
     chat_with_claude,
     classify_dm_intent,
@@ -1244,6 +1245,47 @@ def _pending_task_id(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:10]
 
 
+async def _handle_agent_dm(ctx, msg, text: str, has_image: bool) -> None:
+    """One turn of the owner's assistant session.
+
+    Session per chat, resumed across messages, so context carries: the whole
+    point is that it feels like the terminal conversation rather than a series
+    of unrelated questions.
+
+    The typing indicator is deliberate. These turns run real work and can take
+    minutes; without it the chat looks dead and the natural reaction is to send
+    the message again, which starts a second turn on the same session.
+    """
+    user_id = msg.from_user.id
+    image_path = await _download_image(ctx, msg) if has_image else None
+    image_paths = [str(image_path)] if image_path else None
+
+    session = await _ensure_active_chat(user_id, text or "ish")
+
+    try:
+        await ctx.bot.send_chat_action(chat_id=msg.chat.id, action="typing")
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        response, new_sid = await run_capped(
+            agent_chat,
+            session.session_id,
+            text or "(rasm yuborildi, matn yo'q)",
+            image_paths,
+            priority=budget.CRITICAL, _kind="agent",
+        )
+        if new_sid:
+            chat_sessions.record_turn(user_id, session.name, new_sid)
+        await _send_chat_reply(msg, response or "(bo'sh javob)")
+    except Exception as exc:  # noqa: BLE001
+        log.exception("agent dm failed")
+        await msg.reply_text(f"Bajarilmadi: {exc}")
+    finally:
+        if image_path:
+            _cleanup_image(image_path)
+
+
 async def on_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg or not msg.from_user:
@@ -1321,6 +1363,28 @@ async def on_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         finally:
             for p in image_paths or []:
                 _cleanup_image(p)
+        return
+
+    # ── AGENT MODE ────────────────────────────────────────────────────────
+    # The owner's DMs go straight to a working session. No classifier, no
+    # confirm button, no menu.
+    #
+    # WHY THE CLASSIFIER WAS REMOVED FROM THIS PATH
+    # It sorted every message into one of five bug-triage categories, so
+    # "create a cache and self-optimise" came back as "category: unclear" with
+    # a list of questions — the machinery had no branch for *doing* something.
+    # Reading a directive as a defect report is not a bug in the classifier; it
+    # is the wrong tool in front of the wrong door.
+    #
+    # The prefixes stay for when the old behaviour is wanted on purpose:
+    #   !  run the full triage/diagnosis pipeline
+    #   ?  one-shot read-only question
+    # Anything else is a conversation with an assistant that can act.
+    #
+    # The group path is untouched: staff complaints there still get classified,
+    # which is what that flow is for.
+    if not raw_text.startswith(("!", "?", "/")):
+        await _handle_agent_dm(ctx, msg, raw_text, has_image)
         return
 
     # Priority 2: prefix overrides the classifier.
