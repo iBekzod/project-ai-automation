@@ -754,10 +754,27 @@ xonsaroy-agent-memory is the shared notebook, linked to Obsidian. Before non-tri
 This is how you get stronger over time. A session that solves a problem and records nothing has to solve it again.
 
 SAFETY
-`git push` is blocked while DRY_RUN is on: prepare the change, commit locally, and say it is ready. Before anything hard to reverse — dropping data, restarting production, sending to clients — say what you are about to do and wait for his answer.
+{deploy_rule}
+
+Before anything hard to reverse, say what you are about to do and wait for his answer: dropping or overwriting data, restarting production, sending messages to clients, rotating credentials, deleting branches. Being asked twice costs a message; being wrong once can cost a day.
+
+Deploys are visible work. When you push, say which branch and what it will trigger, and check the result rather than assuming it passed.
 
 His message:
 """
+
+# Two states, and the prompt must match reality: an assistant told it cannot
+# push will refuse to, however the flag is actually set. The string below is
+# substituted into {deploy_rule} at call time.
+DEPLOY_RULE_ALLOWED = (
+    "You can push. `stage` deploys to the staging cluster, `production` deploys "
+    "to the live system that staff and clients use — treat the second one as an "
+    "action with consequences, not a step in a routine."
+)
+DEPLOY_RULE_BLOCKED = (
+    "`git push` is blocked (DRY_RUN is on): prepare the change, commit locally, "
+    "and say it is ready to go out."
+)
 
 
 def agent_chat(
@@ -787,7 +804,11 @@ def agent_chat(
             "\n\nAttached image(s) — Read each one:\n" + lines + "\n"
         )
 
-    full_prompt = AGENT_PROMPT_HEADER + text + image_note
+    header = AGENT_PROMPT_HEADER.replace(
+        "{deploy_rule}",
+        DEPLOY_RULE_BLOCKED if getattr(config, "DRY_RUN", True) else DEPLOY_RULE_ALLOWED,
+    )
+    full_prompt = header + text + image_note
 
     cli = _resolve_cli(config.CLAUDE_CLI)
     args = [cli, "--print", "--output-format", "json", *_add_dir_args()]
