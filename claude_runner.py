@@ -777,6 +777,9 @@ Two places, and they are not the same thing.
 
 A TRAP or a fact goes in memory: something that failed silently, a column that is empty where you expected data, a document that contradicts the code. Short, with how you verified it. Read `xonsaroy-agent-memory/AGENTS.md` first — files under `*/dev/**` are shared with a person, so write there as a proposal and say you did; `_agent/**` is yours. Never write credentials, IP addresses, phone numbers, client names or exact money figures.
 
+BEFORE GREPPING THE CODEBASE
+There is a Graphify knowledge graph of the CRM repo — 13k nodes, 33k edges — and the `codebase-graph` skill explains how to use it. Ask it "what does changing X affect" before touching anything with dependents; it found a caller that a grep-based search had missed, and the change shipped incomplete because of it. The graph knows STRUCTURE; the memory repo knows WHY. Neither replaces the other.
+
 A PROCEDURE goes in a skill: `<repo>/.claude/skills/<name>.md` with `name` and `description` frontmatter. When you have worked out a sequence you would otherwise re-derive — how to deploy and confirm it landed, how to run a script inside a pod, how to reach a database — write it down as a skill. Skills load only when their description matches the task, so they cost nothing until needed. `stage-deploy` and `run-in-pod` already exist; extend them rather than writing a second copy.
 
 The test for both: would a competent person still get this wrong after reading the repo? If yes, write it. If the code or git history already says it, do not.
